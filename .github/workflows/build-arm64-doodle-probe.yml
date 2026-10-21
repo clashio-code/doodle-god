@@ -1,0 +1,436 @@
+name: build-arm64-doodle-probe
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang toolchain ARM 64-bit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Tulis sumber
+        run: |
+          mkdir -p src out/doodle_god/libs
+          cat > src/elfprobe64.c <<'EOF_C1'
+          /* elfprobe64 - Milestone 1 port Doodle God HD (arm64-v8a -> Linux aarch64 handheld).
+           * HANYA MEMBACA: mem-parse libdoodle-everything.so + libc++_shared.so (ELF64 AArch64), lalu cek tiap simbol impor
+           * terhadap library milik device (glibc, Mali GLES/EGL, gl4es, SDL2, zlib). Tidak menjalankan kode game.
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38, device cuma 2.37). */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          #define MAXN 4096
+          #define NRT 2048
+          #ifndef DT_RELR
+          #define DT_RELR 36
+          #endif
+
+          typedef struct {
+            const uint8_t *map; size_t size;
+            const Elf64_Ehdr *eh; const Elf64_Shdr *sh; const Elf64_Phdr *ph;
+            const Elf64_Sym *sym; int nsym; const char *str;
+            const Elf64_Dyn *dyn; int ndyn;
+            unsigned rt[NRT]; unsigned nrela;
+            unsigned relr_bytes, android_packed, nload, ntls, max_align;
+            uint64_t tls_size;
+          } Lib;
+
+          static FILE *rep;
+
+          static void P(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); }
+          }
+
+          static int load_lib(const char *path, Lib *L) {
+            struct stat st;
+            int fd, i;
+            memset(L, 0, sizeof *L);
+            fd = open(path, O_RDONLY);
+            if (fd < 0) { P("GAGAL membuka %s\n", path); return -1; }
+            if (fstat(fd, &st) != 0) { close(fd); return -1; }
+            L->size = (size_t)st.st_size;
+            L->map = mmap(NULL, L->size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (L->map == MAP_FAILED) { P("GAGAL mmap %s\n", path); return -1; }
+            if (L->size < sizeof(Elf64_Ehdr) || memcmp(L->map, ELFMAG, SELFMAG) != 0) { P("%s bukan file ELF\n", path); return -1; }
+            L->eh = (const Elf64_Ehdr *)L->map;
+            if (L->eh->e_ident[EI_CLASS] != ELFCLASS64 || L->eh->e_machine != EM_AARCH64) {
+              P("%s bukan ELF AArch64 64-bit (class=%d machine=%d)\n", path, L->eh->e_ident[EI_CLASS], L->eh->e_machine);
+              return -1;
+            }
+            if ((size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf64_Phdr) <= L->size) {
+              L->ph = (const Elf64_Phdr *)(L->map + L->eh->e_phoff);
+              for (i = 0; i < L->eh->e_phnum; i++) {
+                if (L->ph[i].p_type == PT_LOAD) { L->nload++; if (L->ph[i].p_align > L->max_align) L->max_align = (unsigned)L->ph[i].p_align; }
+                else if (L->ph[i].p_type == PT_TLS) { L->ntls++; L->tls_size = L->ph[i].p_memsz; }
+              }
+            }
+            if (L->eh->e_shoff == 0 || L->eh->e_shentsize != sizeof(Elf64_Shdr) ||
+                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf64_Shdr) > L->size) {
+              P("%s: section header tidak ada/rusak\n", path); return -1;
+            }
+            L->sh = (const Elf64_Shdr *)(L->map + L->eh->e_shoff);
+            for (i = 0; i < L->eh->e_shnum; i++) {
+              const Elf64_Shdr *s = &L->sh[i];
+              if ((size_t)s->sh_offset + s->sh_size > L->size) continue;
+              if (s->sh_type == SHT_DYNSYM) {
+                L->sym = (const Elf64_Sym *)(L->map + s->sh_offset);
+                L->nsym = (int)(s->sh_size / sizeof(Elf64_Sym));
+                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(L->map + L->sh[s->sh_link].sh_offset);
+              } else if (s->sh_type == SHT_DYNAMIC) {
+                L->dyn = (const Elf64_Dyn *)(L->map + s->sh_offset);
+                L->ndyn = (int)(s->sh_size / sizeof(Elf64_Dyn));
+              } else if (s->sh_type == SHT_RELA) {
+                const Elf64_Rela *r = (const Elf64_Rela *)(L->map + s->sh_offset);
+                size_t k, n = s->sh_size / sizeof(Elf64_Rela);
+                for (k = 0; k < n; k++) { unsigned t = (unsigned)ELF64_R_TYPE(r[k].r_info); L->rt[t < NRT ? t : NRT - 1]++; L->nrela++; }
+              } else if (s->sh_type == 19 /* SHT_RELR */) {
+                L->relr_bytes += (unsigned)s->sh_size;
+              } else if (s->sh_type == 0x60000001u || s->sh_type == 0x60000002u /* SHT_ANDROID_REL/RELA */) {
+                L->android_packed += (unsigned)s->sh_size;
+              }
+            }
+            if (!L->sym || !L->str) { P("%s: .dynsym tidak ditemukan\n", path); return -1; }
+            return 0;
+          }
+
+          static const char *rtname(unsigned t) {
+            switch (t) {
+              case 257: return "R_AARCH64_ABS64";
+              case 1024: return "R_AARCH64_COPY";
+              case 1025: return "R_AARCH64_GLOB_DAT";
+              case 1026: return "R_AARCH64_JUMP_SLOT";
+              case 1027: return "R_AARCH64_RELATIVE";
+              case 1028: return "R_AARCH64_TLS_DTPMOD";
+              case 1029: return "R_AARCH64_TLS_DTPREL";
+              case 1030: return "R_AARCH64_TLS_TPREL";
+              case 1031: return "R_AARCH64_TLSDESC";
+              case 1032: return "R_AARCH64_IRELATIVE";
+              default: return NULL;
+            }
+          }
+
+          static void print_header(const Lib *L) {
+            int i;
+            unsigned shown = 0;
+            for (i = 0; i < L->ndyn; i++) {
+              if (L->dyn[i].d_tag == DT_NEEDED) P("  NEEDED %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (L->dyn[i].d_tag == DT_SONAME) P("  SONAME %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (L->dyn[i].d_tag == DT_RELR || L->dyn[i].d_tag == DT_TEXTREL) P("  PERINGATAN: dynamic tag %ld (RELR/TEXTREL) ada -> loader harus mendukungnya\n", (long)L->dyn[i].d_tag);
+              else if (L->dyn[i].d_tag == 0x6000000f || L->dyn[i].d_tag == 0x60000011) P("  PERINGATAN: packed relocation Android (APS2) -> loader harus decode sendiri\n");
+            }
+            P("  PT_LOAD=%u (align maks 0x%x) | PT_TLS=%u (ukuran %llu)\n", L->nload, L->max_align, L->ntls, (unsigned long long)L->tls_size);
+            P("  relokasi RELA total=%u | RELR bytes=%u | packed Android bytes=%u\n", L->nrela, L->relr_bytes, L->android_packed);
+            for (i = 0; i < NRT; i++) if (L->rt[i]) {
+              const char *n = rtname((unsigned)i);
+              if (n) P("    %-22s %u\n", n, L->rt[i]); else P("    tipe %-17d %u\n", i, L->rt[i]);
+              shown++;
+            }
+            (void)shown;
+          }
+
+          static int has_export(const Lib *L, const char *name) {
+            int i;
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(L->str + s->st_name, name) == 0) return 1;
+            }
+            return 0;
+          }
+
+          static int starts(const char *n, const char *p) { return strncmp(n, p, strlen(p)) == 0; }
+
+          /* simbol yang ada di glibc tapi layout/ABI/semantik-nya BEDA dari bionic (Android) -> perlu pembungkus atau dicek */
+          static int abi_risky(const char *n) {
+            static const char *pfx[] = { "pthread_", "sem_", "stat", "fstat", "lstat", "readdir", "scandir", "opendir", "closedir",
+              "setjmp", "longjmp", "_setjmp", "_longjmp", "sigsetjmp", "siglongjmp", "sigaction", "signal", "dl", "strerror_r",
+              "__register_atfork", "dl_iterate_phdr", "_Unwind_", "__gxx_personality", "stdin", "stdout", "stderr", "syscall",
+              "getrusage", "basename", "timezone", "tzset", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          /* API Android murni (libandroid/liblog/libc bionic-only): tidak akan pernah ada di glibc, harus dishim */
+          static int android_api(const char *n) {
+            static const char *pfx[] = { "AAsset", "AAssetManager", "ALooper", "ANativeWindow", "AInput", "ASensor", "AConfiguration",
+              "AAudio", "ANativeActivity", "AndroidBitmap", "AAssetDir", "android_", "__android", "__system_property", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          static void *try_open_any(const char *label, const char **paths) {
+            int i;
+            void *h = NULL;
+            for (i = 0; paths[i]; i++) {
+              h = dlopen(paths[i], RTLD_LAZY | RTLD_LOCAL);
+              if (h) { P("  %-12s OK    : %s\n", label, paths[i]); return h; }
+            }
+            P("  %-12s TIDAK : dicoba", label);
+            for (i = 0; paths[i]; i++) P(" %s", paths[i]);
+            P("\n");
+            return NULL;
+          }
+
+          typedef struct { const char *name[MAXN]; int n; } List;
+          static void add(List *l, const char *s) { if (l->n < MAXN) l->name[l->n++] = s; }
+          static void dump(const char *title, const List *l) {
+            int i;
+            P("\n-- %s (%d)\n", title, l->n);
+            for (i = 0; i < l->n; i++) P("  %s\n", l->name[i]);
+          }
+
+          static void classify(const Lib *L, const Lib *cpp, const char *label, void *h_gles, void *h_mali, void *h_gl4es, void *h_egl) {
+            static List cp, ok, risky, gl, droid, miss;
+            int i, nimp = 0;
+            memset(&cp, 0, sizeof cp); memset(&ok, 0, sizeof ok); memset(&risky, 0, sizeof risky);
+            memset(&gl, 0, sizeof gl); memset(&droid, 0, sizeof droid); memset(&miss, 0, sizeof miss);
+            P("\n=== %s: klasifikasi simbol impor ===\n", label);
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              nimp++;
+              if (cpp && has_export(cpp, n)) { add(&cp, n); continue; }
+              if (android_api(n)) { add(&droid, n); continue; }
+              if (dlsym(RTLD_DEFAULT, n)) { if (abi_risky(n)) add(&risky, n); else add(&ok, n); continue; }
+              if ((h_gles && dlsym(h_gles, n)) || (h_mali && dlsym(h_mali, n)) || (h_gl4es && dlsym(h_gl4es, n)) || (h_egl && dlsym(h_egl, n))) { add(&gl, n); continue; }
+              add(&miss, n);
+            }
+            P("total impor=%d | dari libc++_shared=%d | API Android (wajib shim)=%d | glibc aman=%d | glibc tapi ABI/semantik beda=%d | GL/EGL device=%d | TIDAK ADA=%d\n",
+              nimp, cp.n, droid.n, ok.n, risky.n, gl.n, miss.n);
+            dump("API Android: wajib diimplementasi sendiri (shim)", &droid);
+            dump("ABI-RISK: ada di glibc tapi perlu dicek/pembungkus", &risky);
+            dump("TIDAK ADA di mana pun: perlu shim/implementasi sendiri", &miss);
+          }
+
+          static void gl_report(const Lib *L, void *h_gles, void *h_mali, void *h_gl4es) {
+            int i, total = 0, okm = 0, onlyg = 0;
+            P("\n=== fungsi GL/EGL yang dipakai libdoodle-everything.so ===\n");
+            P("  huruf: C=libGLESv1_CM  M=libmali  G=gl4es  (-=tidak ada)\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              int c, m, g;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              if (strncmp(n, "gl", 2) != 0 && strncmp(n, "egl", 3) != 0) continue;
+              c = h_gles && dlsym(h_gles, n) != NULL; m = h_mali && dlsym(h_mali, n) != NULL; g = h_gl4es && dlsym(h_gl4es, n) != NULL;
+              total++; if (c || m) okm++; else if (g) onlyg++;
+              P("  %c%c%c %s\n", c ? 'C' : '-', m ? 'M' : '-', g ? 'G' : '-', n);
+            }
+            P("ringkas: %d fungsi GL/EGL dipakai, %d tersedia langsung di GLESv1_CM/libmali, %d hanya di gl4es\n", total, okm, onlyg);
+          }
+
+          static void jni_report(const Lib *L) {
+            int i, n = 0, onload = 0;
+            P("\n=== titik masuk JNI terekspor oleh libdoodle-everything.so ===\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *nm;
+              if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+              nm = L->str + s->st_name;
+              if (strcmp(nm, "JNI_OnLoad") == 0) { onload = 1; P("  JNI_OnLoad\n"); }
+              else if (starts(nm, "Java_")) { n++; P("  %s\n", nm + 5); }
+            }
+            P("total Java_*: %d | JNI_OnLoad: %s\n", n, onload ? "ada" : "TIDAK ADA");
+          }
+
+          /* tanda tangan JNI valid: "(" ... ")" diikuti satu tipe (V Z B C S I J F D L[ ) */
+          static int jni_sig(const char *s) {
+            const char *p;
+            if (s[0] != '(') return 0;
+            p = strchr(s, ')');
+            if (!p || !p[1]) return 0;
+            p++;
+            while (*p == '[') p++;
+            if (*p == 'L') return strchr(p, ';') != NULL;
+            return strchr("VZBCSIJFD", *p) != NULL && p[1] == 0;
+          }
+
+          /* string di binary yang menunjukkan apa yang native panggil di sisi Java: tanda tangan metode + nama kelas */
+          static void string_scan(const Lib *L) {
+            static const char *seen[600];
+            int nseen = 0, hits = 0;
+            size_t i, st = 0;
+            P("\n=== string JNI di libdoodle-everything.so (petunjuk panggilan native -> Java) ===\n");
+            for (i = 0; i <= L->size; i++) {
+              unsigned char c = i < L->size ? L->map[i] : 0;
+              if (c >= 32 && c < 127) continue;
+              if (c == 0 && i - st >= 3 && i - st <= 200) {
+                const char *s = (const char *)(L->map + st);
+                int want = jni_sig(s) || strstr(s, "com/joybits") || starts(s, "java/") || starts(s, "android/") || starts(s, "org/") ||
+                           starts(s, "com/google") || starts(s, "javax/");
+                if (want) {
+                  int k, dup = 0;
+                  for (k = 0; k < nseen; k++) if (strcmp(seen[k], s) == 0) { dup = 1; break; }
+                  if (!dup && nseen < 600) { seen[nseen++] = s; hits++; P("  %s\n", s); }
+                }
+              }
+              st = i + 1;
+            }
+            P("total string JNI unik: %d\n", hits);
+          }
+
+          static void env_report(void) {
+            static const char *sdl_paths[] = { "libSDL2-2.0.so.0", "/usr/lib/libSDL2-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0",
+              "/usr/lib64/libSDL2-2.0.so.0", "/lib/libSDL2-2.0.so.0", NULL };
+            static const char *z_paths[] = { "libz.so.1", "/usr/lib/libz.so.1", "/usr/lib/aarch64-linux-gnu/libz.so.1", "/lib/libz.so.1", NULL };
+            static const char *mix_paths[] = { "libSDL2_mixer-2.0.so.0", "/usr/lib/libSDL2_mixer-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2_mixer-2.0.so.0", NULL };
+            static const char *sdl_need[] = { "SDL_Init", "SDL_CreateWindow", "SDL_GL_CreateContext", "SDL_GL_SetAttribute", "SDL_GL_SwapWindow",
+              "SDL_PollEvent", "SDL_OpenAudioDevice", "SDL_PauseAudioDevice", "SDL_GameControllerOpen", "SDL_JoystickOpen", "SDL_GetVersion", NULL };
+            static const char *z_need[] = { "inflate", "inflateInit2_", "inflateEnd", "zlibVersion", NULL };
+            void *h; int i;
+            P("\n== SDL2 / zlib / mixer 64-bit di device ==\n");
+            h = try_open_any("SDL2", sdl_paths);
+            if (h) {
+              unsigned char ver[3] = {0, 0, 0};
+              void (*gv)(void *) = NULL;
+              *(void **)&gv = dlsym(h, "SDL_GetVersion");
+              if (gv) { gv(ver); P("  SDL versi: %u.%u.%u\n", ver[0], ver[1], ver[2]); }
+              for (i = 0; sdl_need[i]; i++) P("  %-26s %s\n", sdl_need[i], dlsym(h, sdl_need[i]) ? "ada" : "TIDAK");
+            }
+            h = try_open_any("zlib", z_paths);
+            if (h) for (i = 0; z_need[i]; i++) P("  %-26s %s\n", z_need[i], dlsym(h, z_need[i]) ? "ada" : "TIDAK");
+            h = try_open_any("SDL2_mixer", mix_paths);
+            (void)h;
+          }
+
+          int main(int argc, char **argv) {
+            Lib dg, cpp;
+            struct utsname u;
+            void *h_gles, *h_mali, *h_gl4es, *h_egl;
+            int have_cpp = 0;
+            static const char *gles_p[] = { "libGLESv1_CM.so.1", "/usr/lib/libGLESv1_CM.so.1", "/usr/lib/aarch64-linux-gnu/libGLESv1_CM.so.1", "/usr/lib64/libGLESv1_CM.so.1", NULL };
+            static const char *mali_p[] = { "/usr/lib/libmali.so", "/usr/lib/libmali.so.1", "/usr/lib/aarch64-linux-gnu/libmali.so", "/usr/lib64/libmali.so", "libmali.so", NULL };
+            static const char *egl_p[] = { "libEGL.so.1", "/usr/lib/libEGL.so.1", "/usr/lib/aarch64-linux-gnu/libEGL.so.1", "/usr/lib64/libEGL.so.1", NULL };
+            static const char *gl4es_p[] = { "/usr/lib/gl4es/libGL.so.1", "/usr/lib/aarch64-linux-gnu/gl4es/libGL.so.1", "/usr/lib64/gl4es/libGL.so.1", NULL };
+
+            if (argc < 2) { fprintf(stderr, "pakai: %s libdoodle-everything.so [libc++_shared.so] [report.txt]\n", argv[0]); return 2; }
+            if (argc > 3) rep = fopen(argv[3], "w");
+
+            P("== elfprobe64 (Doodle God HD, Milestone 1) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
+            P("glibc: %s | page size: %ld\n", gnu_get_libc_version(), (long)sysconf(_SC_PAGESIZE));
+
+            /* muat runtime umum supaya dlsym(RTLD_DEFAULT) mewakili apa yang tersedia untuk game */
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
+
+            P("\n== library grafik 64-bit di device ==\n");
+            h_gles = try_open_any("GLESv1_CM", gles_p);
+            h_mali = try_open_any("libmali", mali_p);
+            h_egl = try_open_any("EGL", egl_p);
+            h_gl4es = try_open_any("gl4es", gl4es_p);
+            if (h_egl) P("  eglGetProcAddress: %s | eglGetDisplay: %s\n", dlsym(h_egl, "eglGetProcAddress") ? "ada" : "TIDAK", dlsym(h_egl, "eglGetDisplay") ? "ada" : "TIDAK");
+
+            env_report();
+
+            P("\n== libdoodle-everything.so ==\n");
+            if (load_lib(argv[1], &dg) != 0) return 1;
+            P("  ukuran file: %zu byte\n", dg.size);
+            print_header(&dg);
+
+            if (argc > 2 && argv[2][0] && load_lib(argv[2], &cpp) == 0) {
+              have_cpp = 1;
+              P("\n== libc++_shared.so ==\n");
+              P("  ukuran file: %zu byte | simbol terekspor: %d\n", cpp.size, cpp.nsym - 1);
+              print_header(&cpp);
+            } else if (argc > 2) P("\n(libc++_shared.so tidak bisa dibaca; klasifikasi C++ dilewati)\n");
+
+            classify(&dg, have_cpp ? &cpp : NULL, "libdoodle-everything.so", h_gles, h_mali, h_gl4es, h_egl);
+            if (have_cpp) classify(&cpp, NULL, "libc++_shared.so", h_gles, h_mali, h_gl4es, h_egl);
+            gl_report(&dg, h_gles, h_mali, h_gl4es);
+            jni_report(&dg);
+            string_scan(&dg);
+
+            P("\n== selesai ==\n");
+            if (rep) fclose(rep);
+            return 0;
+          }
+          EOF_C1
+          cat > out/DoodleProbe.sh <<'EOF_SH'
+          #!/bin/bash
+          # Probe Doodle God HD (Milestone 1, arm64). Hanya membaca, tidak mengubah apa pun.
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
+
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/doodle_god"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/doodle_god"
+
+          cd "$GAMEDIR" || {
+            echo "folder doodle_god tidak ketemu. Dicari di: /$directory/ports/doodle_god dan di sebelah script ini." > "$(dirname "$0")/probe_error.txt"
+            exit 1
+          }
+
+          chmod +x ./elfprobe64 2>/dev/null
+
+          echo "GAMEDIR=$GAMEDIR" > probe_stdout.txt
+          uname -a >> probe_stdout.txt 2>&1
+          if [ ! -f libs/libdoodle-everything.so ] || [ ! -f libs/libc++_shared.so ]; then
+            echo "libs/libdoodle-everything.so dan libs/libc++_shared.so belum ada di $GAMEDIR/libs" > probe_report.txt
+            sleep 3
+            exit 1
+          fi
+
+          ./elfprobe64 libs/libdoodle-everything.so libs/libc++_shared.so probe_report.txt >> probe_stdout.txt 2>&1
+          echo "exit code: $?" >> probe_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH
+          echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
+
+      - name: Kompilasi (aarch64)
+        run: |
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/doodle_god/elfprobe64 src/elfprobe64.c -ldl
+          file out/doodle_god/elfprobe64 || true
+          echo "--- library yang dibutuhkan:"
+          aarch64-linux-gnu-readelf -d out/doodle_god/elfprobe64 | grep NEEDED
+          B=elfprobe64
+          MAXV=$(aarch64-linux-gnu-readelf -V out/doodle_god/$B | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "$B butuh GLIBC tertinggi: $MAXV (device: 2.37)"
+          if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+            echo "GAGAL: $B butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+            aarch64-linux-gnu-nm -D --undefined-only out/doodle_god/$B | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+            exit 1
+          fi
+
+      - name: Unggah hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: doodle-probe-arm64
+          path: out
