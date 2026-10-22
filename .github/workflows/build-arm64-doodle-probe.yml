@@ -370,13 +370,15 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 2 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
-           * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--selftest]
+           * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
            *   stage 0 = muat + relokasi + laporan resolusi simbol (TIDAK ada kode game yang dijalankan)
            *   stage 1 = + jalankan konstruktor (init_array) libc++_shared lalu libdoodle-everything
            *   stage 2 = + JNI_OnLoad libdoodle-everything dengan JNI palsu (semua panggilan Java di-log)
+           *   stage 3 = + jendela SDL2 + GLES1, aset dibaca dari APK, lalu siklus hidup game seperti Android:
+           *             init -> resume -> surfaceChanged -> surfaceCreated -> render x N frame (--frames 0 = sampai keluar)
            * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38). */
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -397,6 +399,8 @@ jobs:
           #include <sys/mman.h>
           #include <sys/stat.h>
           #include <sys/utsname.h>
+          #include <sys/types.h>
+          #include <time.h>
           #include <gnu/libc-version.h>
 
           #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -595,13 +599,131 @@ jobs:
           extern int __xpg_strerror_r(int, char *, size_t);
           static int b_strerror_r(int e, char *buf, size_t n) { return __xpg_strerror_r(e, buf, n); }  /* bionic = versi XSI (int) */
 
-          /* --- asset APK: stub M2 (dibaca nyata di M3) --- */
+          /* --- APK (zip) + AAssetManager palsu: aset dibaca langsung dari doodlegod.apk, inflate lewat libz.so.1 (dlopen) --- */
+          typedef struct { unsigned char *next_in; unsigned avail_in; unsigned long total_in; unsigned char *next_out; unsigned avail_out; unsigned long total_out;
+            char *msg; void *state; void *zalloc, *zfree, *opaque; int data_type; unsigned long adler, reserved; } zs_t;   /* z_stream LP64 = 112 byte */
+          static int (*p_inflateInit2_)(zs_t *, int, const char *, int);
+          static int (*p_inflate)(zs_t *, int);
+          static int (*p_inflateEnd)(zs_t *);
+          static const char *(*p_zlibVersion)(void);
+          static unsigned long (*p_crc32)(unsigned long, const unsigned char *, unsigned);
+          typedef struct { char *name; uint32_t method, csize, usize, loff, crc; } ZEnt;
+          static ZEnt *g_ents;
+          static int g_nents, g_apkfd = -1;
+          static int g_asset_ok, g_asset_miss;
+
+          static uint32_t rd32(const unsigned char *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+          static uint32_t rd16(const unsigned char *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+
+          static int zlib_load(void) {
+            void *h = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+            if (!h) h = dlopen("/usr/lib/libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+            if (!h) { L("[apk] libz.so.1 tidak bisa dimuat\n"); return -1; }
+            *(void **)&p_inflateInit2_ = dlsym(h, "inflateInit2_"); *(void **)&p_inflate = dlsym(h, "inflate");
+            *(void **)&p_inflateEnd = dlsym(h, "inflateEnd"); *(void **)&p_zlibVersion = dlsym(h, "zlibVersion"); *(void **)&p_crc32 = dlsym(h, "crc32");
+            if (!p_inflateInit2_ || !p_inflate || !p_inflateEnd || !p_zlibVersion) { L("[apk] simbol zlib tidak lengkap\n"); return -1; }
+            return 0;
+          }
+
+          static int apk_open(const char *path) {
+            struct stat st;
+            unsigned char *tail, *cd;
+            size_t tl, cdsize, k;
+            long p;
+            uint32_t cdoff;
+            int i, n;
+            g_apkfd = open(path, O_RDONLY);
+            if (g_apkfd < 0) { L("[apk] gagal membuka %s: %s\n", path, strerror(errno)); return -1; }
+            if (fstat(g_apkfd, &st) != 0) return -1;
+            tl = (size_t)st.st_size < 70000 ? (size_t)st.st_size : 70000;
+            tail = malloc(tl);
+            if (!tail || pread(g_apkfd, tail, tl, st.st_size - (off_t)tl) != (ssize_t)tl) { L("[apk] gagal membaca ujung file\n"); return -1; }
+            for (p = (long)tl - 22; p >= 0; p--) if (rd32(tail + p) == 0x06054b50u) break;
+            if (p < 0) { L("[apk] EOCD zip tidak ditemukan\n"); return -1; }
+            n = (int)rd16(tail + p + 10); cdsize = rd32(tail + p + 12); cdoff = rd32(tail + p + 16);
+            free(tail);
+            cd = malloc(cdsize);
+            if (!cd || pread(g_apkfd, cd, cdsize, cdoff) != (ssize_t)cdsize) { L("[apk] gagal membaca central directory\n"); return -1; }
+            g_ents = calloc((size_t)n, sizeof(ZEnt));
+            for (i = 0, k = 0; i < n && k + 46 <= cdsize; i++) {
+              uint32_t nl, el, cl;
+              if (rd32(cd + k) != 0x02014b50u) break;
+              nl = rd16(cd + k + 28); el = rd16(cd + k + 30); cl = rd16(cd + k + 32);
+              g_ents[g_nents].method = rd16(cd + k + 10); g_ents[g_nents].csize = rd32(cd + k + 20);
+              g_ents[g_nents].usize = rd32(cd + k + 24); g_ents[g_nents].loff = rd32(cd + k + 42); g_ents[g_nents].crc = rd32(cd + k + 16);
+              g_ents[g_nents].name = malloc(nl + 1); memcpy(g_ents[g_nents].name, cd + k + 46, nl); g_ents[g_nents].name[nl] = 0;
+              g_nents++; k += 46 + nl + el + cl;
+            }
+            free(cd);
+            L("[apk] %s: %d entri, ukuran %lld byte\n", path, g_nents, (long long)st.st_size);
+            return g_nents > 0 ? 0 : -1;
+          }
+          static ZEnt *apk_find(const char *name) { int i; for (i = 0; i < g_nents; i++) if (strcmp(g_ents[i].name, name) == 0) return &g_ents[i]; return NULL; }
+
+          /* baca satu entri penuh ke memori; mengembalikan buffer malloc (ada +1 byte NUL) atau NULL */
+          static unsigned char *apk_read(const ZEnt *e, long *outlen) {
+            unsigned char hdr[30], *raw, *out;
+            off_t doff;
+            if (pread(g_apkfd, hdr, 30, e->loff) != 30 || rd32(hdr) != 0x04034b50u) return NULL;
+            doff = (off_t)e->loff + 30 + (off_t)rd16(hdr + 26) + (off_t)rd16(hdr + 28);
+            out = malloc((size_t)e->usize + 1);
+            if (!out) return NULL;
+            if (e->method == 0) {
+              if (pread(g_apkfd, out, e->usize, doff) != (ssize_t)e->usize) { free(out); return NULL; }
+            } else if (e->method == 8) {
+              zs_t z;
+              int r;
+              raw = malloc(e->csize ? e->csize : 1);
+              if (!raw || pread(g_apkfd, raw, e->csize, doff) != (ssize_t)e->csize) { free(raw); free(out); return NULL; }
+              memset(&z, 0, sizeof z);
+              z.next_in = raw; z.avail_in = e->csize; z.next_out = out; z.avail_out = e->usize;
+              if (p_inflateInit2_(&z, -15, p_zlibVersion(), (int)sizeof z) != 0) { free(raw); free(out); return NULL; }
+              r = p_inflate(&z, 4 /* Z_FINISH */);
+              p_inflateEnd(&z); free(raw);
+              if (r != 1 /* Z_STREAM_END */) { free(out); return NULL; }
+            } else { free(out); return NULL; }
+            out[e->usize] = 0;
+            *outlen = (long)e->usize;
+            return out;
+          }
+
+          typedef struct { unsigned char *buf; long len, pos; } Asset;
           static char g_amgr_token[8];
-          static void *b_AAssetManager_fromJava(void *env, void *obj) { (void)env; (void)obj; L("[asset] AAssetManager_fromJava\n"); return g_amgr_token; }
-          static void *b_AAssetManager_open(void *m, const char *fn, int mode) { (void)m; L("[asset] AAssetManager_open(\"%s\", %d) -> NULL (belum diimplementasi, M3)\n", fn ? fn : "?", mode); return NULL; }
-          static long b_AAsset_getLength(void *a) { (void)a; return 0; }
-          static int b_AAsset_read(void *a, void *buf, size_t n) { (void)a; (void)buf; (void)n; return -1; }
-          static void b_AAsset_close(void *a) { (void)a; }
+          static void *b_AAssetManager_fromJava(void *env, void *obj) { (void)env; (void)obj; return g_amgr_token; }
+          static void *b_AAssetManager_open(void *m, const char *fn, int mode) {
+            const char *q = fn ? fn : "";
+            char full[700];
+            ZEnt *e;
+            Asset *a;
+            long n = 0;
+            unsigned char *buf;
+            (void)m; (void)mode;
+            while (*q == '/') q++;
+            snprintf(full, sizeof full, "assets/%s", q);
+            e = apk_find(full);
+            if (!e) { if (g_asset_miss++ < 300) L("[asset] open(\"%s\") -> TIDAK ADA di APK\n", q); return NULL; }
+            buf = apk_read(e, &n);
+            if (!buf) { L("[asset] open(\"%s\") -> GAGAL dibaca/inflate\n", q); return NULL; }
+            a = malloc(sizeof *a); a->buf = buf; a->len = n; a->pos = 0;
+            if (g_asset_ok++ < 400) L("[asset] open(\"%s\") -> %ld byte\n", q, n);
+            return a;
+          }
+          static long b_AAsset_getLength(void *h) { return ((Asset *)h)->len; }
+          static long b_AAsset_getRemainingLength(void *h) { Asset *a = h; return a->len - a->pos; }
+          static int b_AAsset_read(void *h, void *buf, size_t n) {
+            Asset *a = h; long rem = a->len - a->pos;
+            if (rem <= 0) return 0;
+            if ((long)n > rem) n = (size_t)rem;
+            memcpy(buf, a->buf + a->pos, n); a->pos += (long)n;
+            return (int)n;
+          }
+          static long b_AAsset_seek(void *h, long off, int whence) {
+            Asset *a = h; long np = whence == 0 ? off : whence == 1 ? a->pos + off : a->len + off;
+            if (np < 0 || np > a->len) return -1;
+            a->pos = np; return np;
+          }
+          static const void *b_AAsset_getBuffer(void *h) { return ((Asset *)h)->buf; }
+          static void b_AAsset_close(void *h) { Asset *a = h; if (a) { free(a->buf); free(a); } }
 
           /* --- dl_iterate_phdr: unwinder C++ (statis di libc++_shared) memakai ini untuk mencari .eh_frame. Modul yang kita muat
            *     sendiri TIDAK terlihat oleh glibc, jadi laporkan sendiri lalu lanjut ke daftar glibc. --- */
@@ -631,7 +753,10 @@ jobs:
             {"fprintf", (void *)b_fprintf}, {"fputs", (void *)b_fputs}, {"fputc", (void *)b_fputc}, {"fwrite", (void *)b_fwrite}, {"fflush", (void *)b_fflush},
             {"setjmp", (void *)_setjmp}, {"strerror_r", (void *)b_strerror_r}, {"dl_iterate_phdr", (void *)b_dl_iterate_phdr},
             {"AAssetManager_fromJava", (void *)b_AAssetManager_fromJava}, {"AAssetManager_open", (void *)b_AAssetManager_open},
-            {"AAsset_getLength", (void *)b_AAsset_getLength}, {"AAsset_read", (void *)b_AAsset_read}, {"AAsset_close", (void *)b_AAsset_close},
+            {"AAsset_getLength", (void *)b_AAsset_getLength}, {"AAsset_getLength64", (void *)b_AAsset_getLength}, {"AAsset_read", (void *)b_AAsset_read},
+            {"AAsset_close", (void *)b_AAsset_close}, {"AAsset_seek", (void *)b_AAsset_seek}, {"AAsset_seek64", (void *)b_AAsset_seek},
+            {"AAsset_getBuffer", (void *)b_AAsset_getBuffer}, {"AAsset_getRemainingLength", (void *)b_AAsset_getRemainingLength},
+            {"AAsset_getRemainingLength64", (void *)b_AAsset_getRemainingLength},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -664,6 +789,7 @@ jobs:
           static MInfo minfo[512];
           static int nminfo;
           static int jlog_budget = 600;
+          static char g_docpath[512] = "";
 
           static void *mk_method(const char *cls, const char *name, const char *sig, int st) {
             int i;
@@ -749,7 +875,15 @@ jobs:
             m->count++;
             fmt_args(m, a, args, sizeof args);
             if (jlog_budget > 0 || m->count <= 3) { L("[Java] %s.%s(%s) -> %c\n", m->cls, m->name, args, rt); if (jlog_budget > 0) jlog_budget--; }
-            if (rt == 'L' && rp && !strcmp(rp + 1, "Ljava/lang/String;")) r->l = mk_handle("");
+            if (rt == 'L' && rp) {
+              char cn[128];
+              const char *q = rp + 2;
+              size_t k = 0;
+              while (*q && *q != ';' && k < sizeof cn - 1) cn[k++] = *q++;
+              cn[k] = 0;
+              if (!strcmp(cn, "java/lang/String")) r->l = mk_handle(!strcmp(m->name, "docPath") ? g_docpath : "");
+              else r->l = mk_obj(cn);   /* objek palsu baru (mis. getAssets() -> AssetManager) agar native tidak menerima NULL */
+            }
           }
 
           #define PREP_VA(mid, ap, a) do { MInfo *mi_ = mi_get(mid); if (mi_) collect_va(mi_->sig, ap, a); } while (0)
@@ -783,6 +917,18 @@ jobs:
 
           static int jni_trap(int i) { L("[JNI] slot %d (%s) dipanggil, belum diimplementasi -> return 0\n", i, jni_names[i]); return 0; }
 
+          static void *j_GetObjectField(void *env, void *obj, void *fid) {
+            const char *f = h2s(fid);
+            size_t n = strlen(f);
+            (void)env; (void)obj;
+            if (n > 18 && !strcmp(f + n - 18, "Ljava/lang/String;")) return mk_handle("");
+            if (n > 1 && f[n - 1] == ';') return mk_obj("field-object");
+            return NULL;
+          }
+          static long j_field0(void *env, void *obj, void *fid) { (void)env; (void)obj; (void)fid; return 0; }
+          static float j_field0f(void *env, void *obj, void *fid) { (void)env; (void)obj; (void)fid; return 0.f; }
+          static double j_field0d(void *env, void *obj, void *fid) { (void)env; (void)obj; (void)fid; return 0.0; }
+          static void j_fieldset(void *env, void *obj, void *fid, ...) { (void)env; (void)obj; (void)fid; }
           static int j_GetVersion(void *env) { (void)env; return 0x00010006; }
           static void *j_FindClass(void *env, const char *n) { (void)env; L("[JNI] FindClass(\"%s\")\n", n); return mk_handle(n); }
           static void *j_GetObjectClass(void *env, void *o) {
@@ -843,6 +989,15 @@ jobs:
             SETFAM(49, Int);    SETFAM(52, Long);    SETFAM(55, Float); SETFAM(58, Double); SETFAM(61, Void);
             g_jni_table[94] = (void *)j_GetFieldID;  g_jni_table[113] = (void *)j_GetStaticMethodID;
             g_jni_table[144] = (void *)j_GetFieldID;
+            for (i = 95; i <= 103; i++) g_jni_table[i] = (void *)j_field0;
+            g_jni_table[95] = (void *)j_GetObjectField;
+            g_jni_table[102] = (void *)j_field0f; g_jni_table[103] = (void *)j_field0d;
+            for (i = 104; i <= 112; i++) g_jni_table[i] = (void *)j_fieldset;
+            for (i = 145; i <= 153; i++) g_jni_table[i] = (void *)j_field0;
+            g_jni_table[145] = (void *)j_GetObjectField;
+            g_jni_table[152] = (void *)j_field0f; g_jni_table[153] = (void *)j_field0d;
+            for (i = 154; i <= 162; i++) g_jni_table[i] = (void *)j_fieldset;
+            g_jni_table[171] = (void *)j_zero2;
             g_jni_table[164] = (void *)j_GetStringLength;
             g_jni_table[167] = (void *)j_NewStringUTF; g_jni_table[168] = (void *)j_GetStringUTFLength;
             g_jni_table[169] = (void *)j_GetStringUTFChars; g_jni_table[170] = (void *)j_ReleaseStringUTFChars;
@@ -1029,6 +1184,202 @@ jobs:
 
           static int pint(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
 
+          /* ======================= SDL2 (dlopen) + konteks GLES1 + input ======================= */
+          static void *sdl_h, *g_win, *g_ctx;
+          static int (*p_SDL_Init)(uint32_t);
+          static int (*p_SDL_InitSubSystem)(uint32_t);
+          static const char *(*p_SDL_GetError)(void);
+          static int (*p_SDL_GL_SetAttribute)(int, int);
+          static void *(*p_SDL_CreateWindow)(const char *, int, int, int, int, uint32_t);
+          static void *(*p_SDL_GL_CreateContext)(void *);
+          static void (*p_SDL_GL_SwapWindow)(void *);
+          static void (*p_SDL_GL_GetDrawableSize)(void *, int *, int *);
+          static int (*p_SDL_GL_SetSwapInterval)(int);
+          static int (*p_SDL_PollEvent)(void *);
+          static const char *(*p_SDL_GetCurrentVideoDriver)(void);
+          static int (*p_SDL_NumJoysticks)(void);
+          static void *(*p_SDL_JoystickOpen)(int);
+          static const char *(*p_SDL_JoystickName)(void *);
+          static int (*p_SDL_IsGameController)(int);
+          static void *(*p_SDL_GameControllerOpen)(int);
+          static const unsigned char *(*p_glGetString)(unsigned);
+          static unsigned (*p_glGetError)(void);
+
+          static int gl_init(int *w, int *h) {
+            static const char *libs[] = { "libSDL2-2.0.so.0", "/usr/lib/libSDL2-2.0.so.0", "libSDL2.so", NULL };
+            int i, ww = 0, hh = 0;
+            for (i = 0; libs[i] && !sdl_h; i++) {
+              sdl_h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
+              L("[sdl] dlopen %s : %s\n", libs[i], sdl_h ? "OK" : dlerror());
+            }
+            if (!sdl_h) return -1;
+          #define SYM(n) do { *(void **)&p_##n = dlsym(sdl_h, #n); if (!p_##n) { L("[sdl] simbol %s tidak ada\n", #n); return -1; } } while (0)
+            SYM(SDL_Init); SYM(SDL_InitSubSystem); SYM(SDL_GetError); SYM(SDL_GL_SetAttribute); SYM(SDL_CreateWindow); SYM(SDL_GL_CreateContext);
+            SYM(SDL_GL_SwapWindow); SYM(SDL_GL_GetDrawableSize); SYM(SDL_GL_SetSwapInterval); SYM(SDL_PollEvent); SYM(SDL_GetCurrentVideoDriver);
+          #undef SYM
+            if (p_SDL_Init(0x00000020u) != 0) { L("[sdl] SDL_Init(VIDEO) gagal: %s\n", p_SDL_GetError()); return -1; }
+            L("[sdl] video driver: %s\n", p_SDL_GetCurrentVideoDriver() ? p_SDL_GetCurrentVideoDriver() : "?");
+            p_SDL_GL_SetAttribute(17, 1);  /* CONTEXT_MAJOR_VERSION */
+            p_SDL_GL_SetAttribute(18, 1);  /* CONTEXT_MINOR_VERSION */
+            p_SDL_GL_SetAttribute(21, 4);  /* PROFILE_MASK = ES */
+            p_SDL_GL_SetAttribute(0, 8); p_SDL_GL_SetAttribute(1, 8); p_SDL_GL_SetAttribute(2, 8); p_SDL_GL_SetAttribute(3, 0);
+            p_SDL_GL_SetAttribute(5, 1); p_SDL_GL_SetAttribute(6, 16); p_SDL_GL_SetAttribute(7, 8);
+            g_win = p_SDL_CreateWindow("Doodle God", 0x1FFF0000, 0x1FFF0000, 640, 480, 0x00000002u | 0x00001001u);
+            if (!g_win) { L("[sdl] SDL_CreateWindow gagal: %s\n", p_SDL_GetError()); return -1; }
+            g_ctx = p_SDL_GL_CreateContext(g_win);
+            if (!g_ctx) { L("[sdl] SDL_GL_CreateContext (GLES1) gagal: %s\n", p_SDL_GetError()); return -1; }
+            p_SDL_GL_SetSwapInterval(1);
+            p_SDL_GL_GetDrawableSize(g_win, &ww, &hh);
+            *w = ww > 0 ? ww : 640; *h = hh > 0 ? hh : 480;
+            *(void **)&p_glGetString = h_gles ? dlsym(h_gles, "glGetString") : NULL;
+            *(void **)&p_glGetError = h_gles ? dlsym(h_gles, "glGetError") : NULL;
+            if (p_glGetString) {
+              L("[gl] VENDOR   : %s\n", (const char *)p_glGetString(0x1F00));
+              L("[gl] RENDERER : %s\n", (const char *)p_glGetString(0x1F01));
+              L("[gl] VERSION  : %s\n", (const char *)p_glGetString(0x1F02));
+            }
+            L("[gl] ukuran drawable: %dx%d\n", *w, *h);
+            return 0;
+          }
+
+          static void pad_init(void) {
+            int i, n;
+            *(void **)&p_SDL_NumJoysticks = dlsym(sdl_h, "SDL_NumJoysticks"); *(void **)&p_SDL_JoystickOpen = dlsym(sdl_h, "SDL_JoystickOpen");
+            *(void **)&p_SDL_JoystickName = dlsym(sdl_h, "SDL_JoystickName"); *(void **)&p_SDL_IsGameController = dlsym(sdl_h, "SDL_IsGameController");
+            *(void **)&p_SDL_GameControllerOpen = dlsym(sdl_h, "SDL_GameControllerOpen");
+            if (p_SDL_InitSubSystem(0x00000200u | 0x00002000u) != 0) { L("[pad] init joystick/controller gagal: %s\n", p_SDL_GetError()); return; }
+            n = p_SDL_NumJoysticks ? p_SDL_NumJoysticks() : 0;
+            L("[pad] joystick terdeteksi: %d\n", n);
+            for (i = 0; i < n; i++) {
+              void *j = p_SDL_JoystickOpen ? p_SDL_JoystickOpen(i) : NULL;
+              int gc = p_SDL_IsGameController ? p_SDL_IsGameController(i) : 0;
+              L("[pad] #%d nama=\"%s\" gamecontroller=%d\n", i, (j && p_SDL_JoystickName) ? p_SDL_JoystickName(j) : "?", gc);
+              if (gc && p_SDL_GameControllerOpen) p_SDL_GameControllerOpen(i);
+            }
+          }
+
+          /* ---- titik masuk native OFAndroidApp (tanda tangan dibaca dari classes2.dex; semuanya static -> (env, kelas, ...)) ---- */
+          typedef void (*nf_init_t)(void *, void *, void *, void *);
+          typedef void (*nf_i_t)(void *, void *, int);
+          typedef void (*nf_ii_t)(void *, void *, int, int);
+          typedef void (*nf_0_t)(void *, void *);
+          typedef void (*nf_touch_t)(void *, void *, int, float, float);
+          typedef int (*nf_ret_t)(void *, void *);
+          static nf_init_t nf_init;
+          static nf_i_t nf_resume, nf_surfaceCreated;
+          static nf_ii_t nf_surfaceChanged;
+          static nf_0_t nf_render;
+          static nf_touch_t nf_touchDown, nf_touchMoved, nf_touchUp;
+          static nf_ret_t nf_backPressed;
+          static void *g_nenv, *g_ncls;
+          static int g_sw = 640, g_sh = 480, g_touch_down, g_btn_back, g_btn_start, g_dp[4], g_quit;
+          static float g_cx = 320.f, g_cy = 240.f, g_ax, g_ay;
+
+          static void *nfind(Mod *m, const char *name) {
+            char full[160];
+            void *f;
+            snprintf(full, sizeof full, "Java_com_joybits_openframeworks_OFAndroidApp_%s", name);
+            f = mod_find(m, full);
+            if (!f) L("[game] titik masuk %s TIDAK ADA\n", full);
+            return f;
+          }
+          static void tap_down(float x, float y) { if (nf_touchDown) { nf_touchDown(g_nenv, g_ncls, 0, x, y); g_touch_down = 1; } }
+          static void tap_up(float x, float y) { if (nf_touchUp && g_touch_down) { nf_touchUp(g_nenv, g_ncls, 0, x, y); g_touch_down = 0; } }
+
+          /* gamepad -> sentuhan: stick kiri/D-pad = kursor, A = ketuk/tahan, B = Back, Select+Start = keluar. Mouse/jari layar sentuh juga diteruskan. */
+          static void pump_events(void) {
+            unsigned char ev[64] __attribute__((aligned(8)));
+            float spd = 10.f, dx, dy;
+            while (p_SDL_PollEvent(ev)) {
+              uint32_t t = *(uint32_t *)ev;
+              if (t == 0x100) g_quit = 1;                                   /* SDL_QUIT */
+              else if (t == 0x653 && p_SDL_GameControllerOpen) p_SDL_GameControllerOpen(*(int32_t *)(ev + 8));   /* CONTROLLERDEVICEADDED */
+              else if (t == 0x651 || t == 0x652) {                           /* CONTROLLERBUTTONDOWN / UP */
+                int down = (t == 0x651), b = ev[12];
+                if (b == 0) { if (down) tap_down(g_cx, g_cy); else tap_up(g_cx, g_cy); }
+                else if (b == 1 && down && nf_backPressed) { int r = (uint8_t)nf_backPressed(g_nenv, g_ncls); L("[input] backPressed -> %d\n", r); }
+                else if (b == 4) g_btn_back = down;
+                else if (b == 6) g_btn_start = down;
+                else if (b >= 11 && b <= 14) g_dp[b - 11] = down;
+                if (g_btn_back && g_btn_start) g_quit = 1;
+              } else if (t == 0x650) {                                       /* CONTROLLERAXISMOTION */
+                float v = (float)(*(int16_t *)(ev + 16)) / 32768.f;
+                if (v > -0.2f && v < 0.2f) v = 0.f;
+                if (ev[12] == 0) g_ax = v; else if (ev[12] == 1) g_ay = v;
+              } else if (t == 0x401) { g_cx = (float)*(int32_t *)(ev + 20); g_cy = (float)*(int32_t *)(ev + 24); tap_down(g_cx, g_cy); }    /* MOUSEBUTTONDOWN */
+              else if (t == 0x402) tap_up((float)*(int32_t *)(ev + 20), (float)*(int32_t *)(ev + 24));
+              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = (float)*(int32_t *)(ev + 20); g_cy = (float)*(int32_t *)(ev + 24); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+              else if (t == 0x700) { g_cx = *(float *)(ev + 24) * (float)g_sw; g_cy = *(float *)(ev + 28) * (float)g_sh; tap_down(g_cx, g_cy); }   /* FINGERDOWN */
+              else if (t == 0x701) tap_up(*(float *)(ev + 24) * (float)g_sw, *(float *)(ev + 28) * (float)g_sh);
+              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = *(float *)(ev + 24) * (float)g_sw; g_cy = *(float *)(ev + 28) * (float)g_sh; nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+            }
+            dx = g_ax + (float)(g_dp[3] - g_dp[2]); dy = g_ay + (float)(g_dp[1] - g_dp[0]);
+            if (dx != 0.f || dy != 0.f) {
+              g_cx += dx * spd; g_cy += dy * spd;
+              if (g_cx < 0.f) g_cx = 0.f;
+              if (g_cx > (float)g_sw) g_cx = (float)g_sw;
+              if (g_cy < 0.f) g_cy = 0.f;
+              if (g_cy > (float)g_sh) g_cy = (float)g_sh;
+              if (g_touch_down && nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy);
+            }
+          }
+
+          static void print_java_summary(void) {
+            int i;
+            L("\n== ringkasan panggilan Java (jumlah) ==\n");
+            for (i = 0; i < nminfo; i++) if (minfo[i].count) L("  %5u  %s.%s%s\n", minfo[i].count, minfo[i].cls, minfo[i].name, minfo[i].sig);
+          }
+          static void gl_check(const char *tag) {
+            unsigned e = p_glGetError ? p_glGetError() : 0;
+            if (e) L("[gl] glGetError setelah %s = 0x%x\n", tag, e);
+          }
+          static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
+
+          /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
+           * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
+          static int run_game(Mod *dg, int frames, int sc) {
+            int w = 640, h = 480, f;
+            long long next, t0, step = 16666667LL;
+            void *gs, *doc;
+            nf_init = (nf_init_t)nfind(dg, "init"); nf_resume = (nf_i_t)nfind(dg, "resume");
+            nf_surfaceChanged = (nf_ii_t)nfind(dg, "surfaceChanged"); nf_surfaceCreated = (nf_i_t)nfind(dg, "surfaceCreated");
+            nf_render = (nf_0_t)nfind(dg, "render"); nf_touchDown = (nf_touch_t)nfind(dg, "touchDown");
+            nf_touchMoved = (nf_touch_t)nfind(dg, "touchMoved"); nf_touchUp = (nf_touch_t)nfind(dg, "touchUp");
+            nf_backPressed = (nf_ret_t)nfind(dg, "backPressed");
+            if (!nf_init || !nf_resume || !nf_surfaceChanged || !nf_surfaceCreated || !nf_render) return 1;
+            if (gl_init(&w, &h) != 0) { L("GL gagal, berhenti.\n"); return 1; }
+            g_sw = w; g_sh = h; g_cx = (float)w / 2.f; g_cy = (float)h / 2.f;
+            pad_init();
+            g_nenv = (void *)&g_envobj;
+            g_ncls = mk_handle("com/joybits/openframeworks/OFAndroidApp");
+            gs = mk_obj("com/joybits/doodleeverything/GameService");
+            doc = mk_handle(g_docpath);
+
+            L("\n== siklus hidup game (stage 3) ==\n");
+            L("[game] OFAndroidApp.init(GameService, \"%s\")\n", g_docpath);
+            nf_init(g_nenv, g_ncls, gs, doc);               L("[game] init selesai\n"); gl_check("init");
+            L("[game] OFAndroidApp.resume(false)\n");
+            nf_resume(g_nenv, g_ncls, 0);                   L("[game] resume selesai\n");
+            L("[game] OFAndroidApp.surfaceChanged(%d, %d)\n", w, h);
+            nf_surfaceChanged(g_nenv, g_ncls, w, h);        L("[game] surfaceChanged selesai\n"); gl_check("surfaceChanged");
+            L("[game] OFAndroidApp.surfaceCreated(%d)\n", sc);
+            nf_surfaceCreated(g_nenv, g_ncls, sc);          L("[game] surfaceCreated selesai\n"); gl_check("surfaceCreated");
+
+            L("[game] mulai loop render (%s)\n", frames > 0 ? "jumlah frame terbatas" : "sampai Select+Start / tutup");
+            t0 = next = now_ns();
+            for (f = 0; (frames <= 0 || f < frames) && !g_quit; f++) {
+              long long n;
+              pump_events();
+              nf_render(g_nenv, g_ncls);
+              p_SDL_GL_SwapWindow(g_win);
+              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai\n", f); gl_check("render"); }
+              next += step; n = now_ns();
+              if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
+            }
+            L("[game] loop selesai: %d frame dalam %.2f detik | aset dibuka=%d tidak-ada=%d\n", f, (double)(now_ns() - t0) / 1e9, g_asset_ok, g_asset_miss);
+            return 0;
+          }
+
           /* ======================= uji mandiri (jalan di x86 maupun aarch64) ======================= */
           static int st_va(const char *sig, ...) {
             va_list ap; jv a[16]; int n;
@@ -1039,6 +1390,7 @@ jobs:
           typedef void *(*fn_mid_t)(void *, void *, const char *, const char *);
           typedef void (*fn_callv_t)(void *, void *, void *, ...);
           typedef const char *(*fn_utf_t)(void *, void *, unsigned char *);
+          static const char *g_apk_arg = "doodlegod.apk";
           static int selftest(void) {
             int ok = 1;
             void *env = (void *)&g_envobj;
@@ -1065,6 +1417,29 @@ jobs:
               if (!strcmp(h2s(cls), "com/joybits/Test") && minfo[0].count == 1 && n0 >= 1 && !strcmp(((fn_utf_t)tbl[169])(env, s, NULL), "halo") && tbl[4] && ((int (*)(void *))tbl[4])(env) == 0x10006) L("  JNI via tabel (FindClass/GetMethodID/NewStringUTF/CallVoidMethod): LULUS\n");
               else { L("  JNI via tabel: GAGAL\n"); ok = 0; }
             }
+            if (access(g_apk_arg, R_OK) == 0) {   /* tes pembaca APK + inflate dengan CRC32 dari zip */
+              int i, tested = 0, bad = 0, stored = 0, defl = 0;
+              long len = 0;
+              if (zlib_load() != 0 || apk_open(g_apk_arg) != 0 || !p_crc32) { L("  APK: GAGAL dibuka\n"); ok = 0; }
+              else {
+                for (i = 0; i < g_nents; i++) {
+                  ZEnt *e = &g_ents[i];
+                  unsigned char *b;
+                  if (strncmp(e->name, "assets/", 7) || e->usize == 0 || (i % 7) != 0) continue;
+                  b = apk_read(e, &len);
+                  if (!b || (uint32_t)p_crc32(0, b, (unsigned)len) != e->crc) { L("  APK: CRC beda/gagal baca: %s\n", e->name); bad++; }
+                  else { if (e->method == 0) stored++; else defl++; }
+                  free(b); tested++;
+                }
+                L("  APK: %d aset diuji (stored=%d deflate=%d) | CRC salah=%d -> %s\n", tested, stored, defl, bad, bad ? "GAGAL" : "LULUS");
+                if (bad || !tested) ok = 0;
+                { void *a = b_AAssetManager_open(g_amgr_token, "AVConfig.json", 0); char head[48] = {0};
+                  if (a && b_AAsset_getLength(a) > 0 && b_AAsset_read(a, head, 40) == 40) L("  AAssetManager_open/read(\"AVConfig.json\"): LULUS (%ld byte, awal: %.30s)\n", b_AAsset_getLength(a), head);
+                  else { L("  AAssetManager_open(\"AVConfig.json\"): GAGAL\n"); ok = 0; }
+                  if (a) b_AAsset_close(a);
+                  if (b_AAssetManager_open(g_amgr_token, "tidak/ada/file.bin", 0) == NULL) L("  open aset tak-ada -> NULL: LULUS\n"); else { L("  open aset tak-ada: GAGAL\n"); ok = 0; } }
+              }
+            } else L("  (APK %s tidak ada: tes aset dilewati)\n", g_apk_arg);
             L("== selftest %s ==\n", ok ? "SEMUA LULUS" : "ADA YANG GAGAL");
             return ok ? 0 : 1;
           }
@@ -1072,7 +1447,7 @@ jobs:
           /* ======================= main ======================= */
           int main(int argc, char **argv) {
             const char *dir = "libs";
-            int stage = 0, timeout = 60, i, do_selftest = 0;
+            int stage = 0, timeout = 60, i, do_selftest = 0, frames = 600, sc = 1;
             Mod *cpp = NULL, *dg = NULL;
             struct sigaction sa;
             struct utsname u;
@@ -1082,12 +1457,15 @@ jobs:
               if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
               else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = pint(argv[++i]);
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 2) ==\n");
+            L("== doodleloader (Milestone 3) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
-            L("libs: %s | stage=%d timeout=%ds\n", dir, stage, timeout);
+            L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
             L("(bukan aarch64: hanya stage 0 / selftest yang valid; kode game TIDAK akan dijalankan)\n");
             if (stage > 0) stage = 0;
@@ -1101,6 +1479,7 @@ jobs:
             sigaction(SIGFPE, &sa, NULL);  sigaction(SIGABRT, &sa, NULL);
             signal(SIGALRM, on_alarm);
 
+            { char cwd[400]; if (getcwd(cwd, sizeof cwd)) snprintf(g_docpath, sizeof g_docpath, "%s/files/", cwd); else snprintf(g_docpath, sizeof g_docpath, "./files/"); }
             init_jni();
             if (do_selftest) return selftest();
             if (tls_guard_check() != 0 && stage > 0) { L("kanari TLS tidak cocok: kode game akan crash 'stack smashing'. Berhenti.\n"); return 1; }
@@ -1133,10 +1512,20 @@ jobs:
               L("\n== JNI_OnLoad (stage 2) ==\n");
               if (!fn) { L("JNI_OnLoad tidak ada\n"); return 1; }
               L("JNI_OnLoad -> 0x%x\n", ((int (*)(void *, void *))fn)((void *)&g_vmobj, NULL));
-              L("\n== ringkasan panggilan Java (jumlah) ==\n");
-              for (i = 0; i < nminfo; i++) if (minfo[i].count) L("  %5u  %s.%s%s\n", minfo[i].count, minfo[i].cls, minfo[i].name, minfo[i].sig);
             }
-            L("\n== Milestone 2 selesai (stage %d) ==\n", stage);
+            if (stage >= 3) {
+              int rc;
+              mkdir("files", 0755);
+              if (zlib_load() != 0 || apk_open(g_apk_arg) != 0) { L("Tidak bisa membuka APK '%s' (salin APK Doodle God ke folder game dan namai doodlegod.apk, atau pakai --apk). Berhenti.\n", g_apk_arg); return 1; }
+              if (frames <= 0) alarm(0);
+              rc = run_game(dg, frames, sc);
+              print_java_summary();
+              L("\n== Milestone 3 selesai (stage 3, rc=%d) ==\n", rc);
+              fflush(NULL);
+              _exit(rc);
+            }
+            if (stage >= 2) print_java_summary();
+            L("\n== selesai (stage %d) ==\n", stage);
             fflush(NULL);
             _exit(0);   /* hindari destruktor atexit milik game */
           }
@@ -1255,7 +1644,7 @@ jobs:
           EOF_SH1
           cat > out/DoodleLoader.sh <<'EOF_SH2'
           #!/bin/bash
-          # Doodle God HD loader (Milestone 2, arm64). Argumen dibaca dari loader.args, mis: --stage 0 --timeout 60
+          # Doodle God HD loader (Milestone 3, arm64). Argumen dibaca dari loader.args, mis: --stage 3 --frames 600 --timeout 120
           # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
 
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -1294,13 +1683,13 @@ jobs:
           rm -f loader_log.txt
           LOADER_ARGS="$(cat loader.args 2>/dev/null)"
           echo "GAMEDIR=$GAMEDIR  args=$LOADER_ARGS" > loader_stdout.txt
-          [ -f doodlegod.apk ] || echo "(info) doodlegod.apk belum ada di $GAMEDIR: belum dibutuhkan sampai M3" >> loader_stdout.txt
+          [ -f doodlegod.apk ] || echo "PERINGATAN: doodlegod.apk tidak ada di $GAMEDIR (dibutuhkan mulai --stage 3: salin APK Doodle God dan namai doodlegod.apk)" >> loader_stdout.txt
           ./doodleloader libs $LOADER_ARGS >> loader_stdout.txt 2>&1
           echo "exit code: $?" >> loader_stdout.txt
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH2
-          echo "--stage 0 --timeout 60" > out/doodle_god/loader.args
+          echo "--stage 3 --frames 600 --timeout 120 --sc 1" > out/doodle_god/loader.args
           echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
