@@ -1265,6 +1265,269 @@ jobs:
           static int g_resq_n;
           static void *g_retarr[512];
 
+          /* ======================= AUDIO: AndroidSound (efek) + Player (musik) -> SDL2 audio + minimp3 ======================= */
+          #if defined(__has_include)
+          #if __has_include("minimp3.h")
+          #define MINIMP3_IMPLEMENTATION
+          #include "minimp3.h"
+          #define HAVE_MP3 1
+          #endif
+          #endif
+          #define AU_RATE 44100
+          #define AU_MAXSND 256
+          #define AU_MAXVOX 32
+          #define AU_MAXMUS 8
+          static void *g_cur_o;                   /* objek Java (this) dari panggilan JNI Call*Method terakhir */
+          static int g_audio = 1;                 /* --audio 0 = matikan */
+          static void *au_h; static int au_ok, au_tried;
+          static uint32_t au_dev;
+          static int (*p_SDL_OpenAudioDevice_)(const char *, int, const void *, void *, int);
+          static void (*p_SDL_PauseAudioDevice_)(uint32_t, int);
+          static void (*p_SDL_LockAudioDevice_)(uint32_t);
+          static void (*p_SDL_UnlockAudioDevice_)(uint32_t);
+          typedef struct { int16_t *pcm; int n; float vol; char path[200]; } AuSnd;
+          typedef struct { int snd, pos, loop, vid, active; } AuVox;
+          typedef struct {
+            void *h; char path[200]; int64_t ptr; unsigned char *data; long len, off;
+            int16_t buf[2304 * 2]; int bn, bp, hz, ch, playing, ended, eof, init, tail;
+            double phase, step; int16_t f0[2], f1[2]; float vol;
+          #ifdef HAVE_MP3
+            mp3dec_t dec;
+          #endif
+          } AuMus;
+          static AuSnd au_snd[AU_MAXSND]; static int au_nsnd;
+          static AuVox au_vox[AU_MAXVOX]; static int au_vserial = 1;
+          static AuMus au_mus[AU_MAXMUS]; static int au_nmus;
+          static int64_t au_done_q[16]; static int au_done_n;
+
+          static unsigned char *au_load_file(const char *path, long *len) {
+            char full[700]; const char *q = path; ZEnt *e; char hp[700]; FILE *fp;
+            while (*q == '/') q++;
+            snprintf(full, sizeof full, "assets/%s", q);
+            e = apk_find(full);
+            if (e) return apk_read(e, len);
+            host_path(path, hp, sizeof hp);
+            fp = fopen(hp, "rb");
+            if (fp) {
+              unsigned char *b; long n;
+              fseek(fp, 0, SEEK_END); n = ftell(fp); fseek(fp, 0, SEEK_SET);
+              b = malloc((size_t)n + 1);
+              if (b && fread(b, 1, (size_t)n, fp) == (size_t)n) { fclose(fp); *len = n; return b; }
+              free(b); fclose(fp);
+            }
+            return NULL;
+          }
+
+          static int au_mus_next(AuMus *m, int16_t out[2]) {
+          #ifdef HAVE_MP3
+            while (m->bp >= m->bn) {
+              mp3dec_frame_info_t info; int n;
+              if (m->eof || m->off >= m->len) { m->eof = 1; out[0] = out[1] = 0; return 0; }
+              n = mp3dec_decode_frame(&m->dec, m->data + m->off, (int)(m->len - m->off), m->buf, &info);
+              if (info.frame_bytes <= 0) { m->eof = 1; out[0] = out[1] = 0; return 0; }
+              m->off += info.frame_bytes;
+              if (n > 0) {
+                int i;
+                if (!m->init || (info.hz && info.hz != m->hz)) { m->hz = info.hz; m->step = (double)m->hz / AU_RATE; m->init = 1; }
+                m->ch = info.channels;
+                if (m->ch == 1) { for (i = n - 1; i >= 0; i--) { m->buf[i * 2] = m->buf[i]; m->buf[i * 2 + 1] = m->buf[i]; } }
+                else if (m->ch > 2) { m->ch = 2; }
+                m->bn = n; m->bp = 0;
+              }
+            }
+            out[0] = m->buf[m->bp * 2]; out[1] = m->buf[m->bp * 2 + 1]; m->bp++;
+            return 1;
+          #else
+            (void)m; out[0] = out[1] = 0; return 0;
+          #endif
+          }
+          static void au_mus_rewind(AuMus *m) {
+          #ifdef HAVE_MP3
+            mp3dec_init(&m->dec);
+          #endif
+            m->off = 0; m->bn = m->bp = 0; m->eof = 0; m->ended = 0; m->tail = 0; m->init = 0; m->phase = 0; m->step = 1;
+            m->f0[0] = m->f0[1] = m->f1[0] = m->f1[1] = 0;
+            /* lewati ID3v2 */
+            if (m->len > 10 && !memcmp(m->data, "ID3", 3)) {
+              long sz = ((m->data[6] & 0x7f) << 21) | ((m->data[7] & 0x7f) << 14) | ((m->data[8] & 0x7f) << 7) | (m->data[9] & 0x7f);
+              m->off = 10 + sz; if (m->off > m->len) m->off = 0;
+            }
+            au_mus_next(m, m->f1); m->phase = 1.0;
+          }
+
+          static void au_callback(void *ud, uint8_t *stream, int len) {
+            int16_t *o = (int16_t *)stream; int frames = len / 4, i, v, k;
+            (void)ud;
+            for (i = 0; i < frames; i++) {
+              int32_t l = 0, r = 0;
+              for (v = 0; v < AU_MAXVOX; v++) {
+                AuVox *x = &au_vox[v];
+                if (!x->active) continue;
+                {
+                  AuSnd *s = &au_snd[x->snd];
+                  if (x->pos >= s->n) { if (x->loop && s->n > 0) x->pos = 0; else { x->active = 0; continue; } }
+                  l += (int32_t)(s->pcm[x->pos * 2] * s->vol); r += (int32_t)(s->pcm[x->pos * 2 + 1] * s->vol); x->pos++;
+                }
+              }
+              for (k = 0; k < au_nmus; k++) {
+                AuMus *m = &au_mus[k];
+                double a;
+                if (!m->playing || !m->data) continue;
+                while (m->phase >= 1.0) {
+                  m->phase -= 1.0; m->f0[0] = m->f1[0]; m->f0[1] = m->f1[1];
+                  if (!au_mus_next(m, m->f1)) m->tail++;
+                }
+                a = m->phase;
+                l += (int32_t)((m->f0[0] + (m->f1[0] - m->f0[0]) * a) * m->vol);
+                r += (int32_t)((m->f0[1] + (m->f1[1] - m->f0[1]) * a) * m->vol);
+                m->phase += m->step;
+                if (m->tail >= 2) {
+                  m->playing = 0; m->ended = 1;
+                  if (au_done_n < 16) au_done_q[au_done_n++] = m->ptr;
+                }
+              }
+              if (l > 32767) l = 32767;
+              if (l < -32768) l = -32768;
+              if (r > 32767) r = 32767;
+              if (r < -32768) r = -32768;
+              o[i * 2] = (int16_t)l; o[i * 2 + 1] = (int16_t)r;
+            }
+          }
+
+          static int au_init(void) {
+            struct { int freq; uint16_t format; uint8_t channels, silence; uint16_t samples, padding; uint32_t size; void (*callback)(void *, uint8_t *, int); void *userdata; } want, have;
+            int (*initsub)(uint32_t);
+            if (au_tried) return au_ok;
+            au_tried = 1;
+            if (!g_audio) return 0;
+          #ifndef HAVE_MP3
+            L("[audio] dibangun TANPA minimp3.h -> tanpa suara\n");
+            return 0;
+          #endif
+            au_h = dlopen("libSDL2-2.0.so.0", RTLD_NOW);
+            if (!au_h) { L("[audio] SDL2 tidak bisa dibuka\n"); return 0; }
+            *(void **)&initsub = dlsym(au_h, "SDL_InitSubSystem");
+            *(void **)&p_SDL_OpenAudioDevice_ = dlsym(au_h, "SDL_OpenAudioDevice");
+            *(void **)&p_SDL_PauseAudioDevice_ = dlsym(au_h, "SDL_PauseAudioDevice");
+            *(void **)&p_SDL_LockAudioDevice_ = dlsym(au_h, "SDL_LockAudioDevice");
+            *(void **)&p_SDL_UnlockAudioDevice_ = dlsym(au_h, "SDL_UnlockAudioDevice");
+            if (!initsub || !p_SDL_OpenAudioDevice_ || !p_SDL_PauseAudioDevice_ || !p_SDL_LockAudioDevice_ || !p_SDL_UnlockAudioDevice_) { L("[audio] simbol SDL audio kurang\n"); return 0; }
+            if (initsub(0x10u) != 0) { L("[audio] SDL_InitSubSystem(AUDIO) gagal\n"); return 0; }
+            memset(&want, 0, sizeof want); memset(&have, 0, sizeof have);
+            want.freq = AU_RATE; want.format = 0x8010; want.channels = 2; want.samples = 1024; want.callback = au_callback;
+            au_dev = (uint32_t)p_SDL_OpenAudioDevice_(NULL, 0, &want, &have, 0);
+            if (au_dev == 0) { L("[audio] SDL_OpenAudioDevice gagal\n"); return 0; }
+            L("[audio] perangkat audio OK: want %d Hz s16 stereo, have %d Hz fmt=0x%x ch=%d samples=%d\n", want.freq, have.freq, have.format, have.channels, have.samples);
+            if (have.freq != AU_RATE || have.format != 0x8010 || have.channels != 2) L("[audio] PERINGATAN: format perangkat berbeda dari yang diminta (audio bisa terdengar salah)\n");
+            p_SDL_PauseAudioDevice_(au_dev, 0);
+            au_ok = 1;
+            return 1;
+          }
+          #define AU_LOCK() do { if (au_ok) p_SDL_LockAudioDevice_(au_dev); } while (0)
+          #define AU_UNLOCK() do { if (au_ok) p_SDL_UnlockAudioDevice_(au_dev); } while (0)
+
+          static int au_add_sound(const char *path) {
+            int i; long len = 0; unsigned char *data; AuSnd *s;
+            if (!au_init()) return 0;
+            for (i = 0; i < au_nsnd; i++) if (!strcmp(au_snd[i].path, path)) return i;
+            if (au_nsnd >= AU_MAXSND) return 0;
+            data = au_load_file(path, &len);
+            s = &au_snd[au_nsnd];
+            snprintf(s->path, sizeof s->path, "%s", path); s->vol = 1.f; s->pcm = NULL; s->n = 0;
+            if (!data) { L("[audio] addSound: file tidak ada: %s\n", path); return au_nsnd++; }
+          #ifdef HAVE_MP3
+            {
+              mp3dec_t dec; mp3dec_frame_info_t info; static int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+              long off = 0, cap = 0, tot = 0; int16_t *raw = NULL; int hz = 0, n;
+              if (len > 10 && !memcmp(data, "ID3", 3)) off = 10 + (((data[6] & 0x7f) << 21) | ((data[7] & 0x7f) << 14) | ((data[8] & 0x7f) << 7) | (data[9] & 0x7f));
+              mp3dec_init(&dec);
+              while (off < len) {
+                n = mp3dec_decode_frame(&dec, data + off, (int)(len - off), pcm, &info);
+                if (info.frame_bytes <= 0) break;
+                off += info.frame_bytes;
+                if (n > 0) {
+                  int j;
+                  if (!hz) hz = info.hz;
+                  if (tot + n > cap) { cap = (tot + n) * 2 + 4096; raw = realloc(raw, (size_t)cap * 4); if (!raw) break; }
+                  for (j = 0; j < n; j++) {
+                    if (info.channels == 1) { raw[(tot + j) * 2] = pcm[j]; raw[(tot + j) * 2 + 1] = pcm[j]; }
+                    else { raw[(tot + j) * 2] = pcm[j * info.channels]; raw[(tot + j) * 2 + 1] = pcm[j * info.channels + 1]; }
+                  }
+                  tot += n;
+                }
+              }
+              if (raw && tot > 0 && hz > 0) {
+                long outn = (long)((double)tot * AU_RATE / hz), k; int16_t *res = malloc((size_t)outn * 4 + 4);
+                if (res) {
+                  for (k = 0; k < outn; k++) {
+                    double sp = (double)k * hz / AU_RATE; long i0 = (long)sp; double fr = sp - (double)i0; long i1 = i0 + 1 < tot ? i0 + 1 : i0; int c;
+                    for (c = 0; c < 2; c++) res[k * 2 + c] = (int16_t)(raw[i0 * 2 + c] + (raw[i1 * 2 + c] - raw[i0 * 2 + c]) * fr);
+                  }
+                  s->pcm = res; s->n = (int)outn;
+                }
+              }
+              free(raw);
+            }
+          #endif
+            free(data);
+            L("[audio] addSound #%d %s -> %d frame\n", au_nsnd, path, s->n);
+            return au_nsnd++;
+          }
+          static int au_play(int id, int loop) {
+            int i, vid = 0;
+            if (!au_ok || id < 0 || id >= au_nsnd || !au_snd[id].pcm) return 0;
+            AU_LOCK();
+            for (i = 0; i < AU_MAXVOX; i++) if (!au_vox[i].active) {
+              au_vox[i].snd = id; au_vox[i].pos = 0; au_vox[i].loop = loop; au_vox[i].vid = vid = au_vserial++; au_vox[i].active = 1; break;
+            }
+            AU_UNLOCK();
+            return vid;
+          }
+          static void au_stop(int a, int b) {
+            int i, hit = 0;
+            if (!au_ok) return;
+            AU_LOCK();
+            for (i = 0; i < AU_MAXVOX; i++) if (au_vox[i].active && (au_vox[i].vid == a || au_vox[i].vid == b)) { au_vox[i].active = 0; hit = 1; }
+            if (!hit) for (i = 0; i < AU_MAXVOX; i++) if (au_vox[i].active && au_vox[i].snd == a) au_vox[i].active = 0;
+            AU_UNLOCK();
+          }
+          static AuMus *au_find_mus(void *h) { int i; for (i = 0; i < au_nmus; i++) if (au_mus[i].h == h) return &au_mus[i]; return NULL; }
+
+          /* dipanggil di akhir java_invoke: hubungkan metode AndroidSound/Player/createPlayer ke mesin audio */
+          static void au_java(const MInfo *m, const jv *a, jv *r, char rt) {
+            AuMus *p;
+            (void)rt;
+            if (!strstr(m->cls, "AndroidSound") && !strstr(m->cls, "Player") && strcmp(m->name, "createPlayer")) return;
+            if (!strcmp(m->name, "createPlayer")) {
+              long len = 0;
+              if (!au_init() || au_nmus >= AU_MAXMUS) return;
+              p = &au_mus[au_nmus];
+              memset(p, 0, sizeof *p);
+              snprintf(p->path, sizeof p->path, "%s", h2s(a[0].l)); p->ptr = a[1].j; p->h = r->l; p->vol = 1.f;
+              p->data = au_load_file(p->path, &len); p->len = len;
+              if (!p->data) { L("[audio] createPlayer: file tidak ada: %s\n", p->path); }
+              else au_mus_rewind(p);
+              L("[audio] createPlayer %s (%ld byte)\n", p->path, len);
+              AU_LOCK(); au_nmus++; AU_UNLOCK();
+              return;
+            }
+            if (strstr(m->cls, "AndroidSound")) {
+              if (!strcmp(m->name, "addSound")) r->i = au_add_sound(h2s(a[0].l));
+              else if (!strcmp(m->name, "play")) r->i = au_play(a[0].i, a[1].i);
+              else if (!strcmp(m->name, "stop")) au_stop(a[0].i, a[1].i);
+              else if (!strcmp(m->name, "setVolume") && au_ok && a[0].i >= 0 && a[0].i < au_nsnd) au_snd[a[0].i].vol = a[1].f;
+              return;
+            }
+            p = au_find_mus(g_cur_o);
+            if (!p) return;
+            AU_LOCK();
+            if (!strcmp(m->name, "start")) { if (p->ended || p->eof) au_mus_rewind(p); p->playing = p->data != NULL; }
+            else if (!strcmp(m->name, "pause")) p->playing = 0;
+            else if (!strcmp(m->name, "stop")) { p->playing = 0; au_mus_rewind(p); }
+            else if (!strcmp(m->name, "setVolume")) p->vol = a[0].f;
+            else if (!strcmp(m->name, "isPlaying")) r->i = p->playing;
+            AU_UNLOCK();
+          }
           /* semua panggilan native -> Java lewat sini: di-log lengkap dengan argumen; nilai balik default (0 / string kosong) */
           static void java_invoke(void *mid, const jv *a, jv *r) {
             MInfo *m = mi_get(mid);
@@ -1304,17 +1567,18 @@ jobs:
               else if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
               else L("[res] antrean penuh, loadResource dibuang\n");
             }
+            au_java(m, a, r, rt);
           }
 
           #define PREP_VA(mid, ap, a) do { MInfo *mi_ = mi_get(mid); if (mi_) collect_va(mi_->sig, ap, a); } while (0)
 
           #define DEFCALL(NAME, CT, CONV) \
-            static CT j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
-            static CT j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
-            static CT j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; } \
-            static CT j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
-            static CT j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
-            static CT j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; }
+            static CT j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; g_cur_o = o; java_invoke(mid, args, &r); return CONV; } \
+            static CT j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; g_cur_o = o; java_invoke(mid, args, &r); return CONV; }
 
           DEFCALL(Object, void *, r.l)
           DEFCALL(Boolean, uint8_t, (uint8_t)r.i)
@@ -1327,12 +1591,12 @@ jobs:
           DEFCALL(Double, double, r.d)
 
           #define DEFCALLV(NAME) \
-            static void j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
-            static void j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
-            static void j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); } \
-            static void j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
-            static void j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
-            static void j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); }
+            static void j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; g_cur_o = o; java_invoke(mid, args, &r); } \
+            static void j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; g_cur_o = o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; g_cur_o = o; java_invoke(mid, args, &r); }
           DEFCALLV(Void)
 
           static int jni_trap(int i) { L("[JNI] slot %d (%s) dipanggil, belum diimplementasi -> return 0\n", i, jni_names[i]); return 0; }
@@ -1370,7 +1634,7 @@ jobs:
           static void *j_NewObjectA(void *env, void *cls, void *mid, const jv *a) { (void)env; (void)mid; (void)a; L("[JNI] NewObjectA(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
           static void *j_AllocObject(void *env, void *cls) { (void)env; return mk_obj(h2s(cls)); }
           static void *j_ident(void *env, void *o) { (void)env; return o; }
-          static void j_void2(void *env, void *o) { (void)env; (void)o; }
+          static void j_void2(void *env, void *o) { (void)env; g_cur_o = o; }
           static void j_void1(void *env) { (void)env; }
           static int j_zero1(void *env) { (void)env; return 0; }
           static int j_zero2(void *env, int x) { (void)env; (void)x; return 0; }
@@ -1940,9 +2204,21 @@ jobs:
           }
 
           /* dipanggil tiap frame: antrean loadResource (mode --resq 1) dan jawaban lisensi */
+          static void au_pump(Mod *dg) {
+            int64_t q[16]; int n, i;
+            if (!au_ok) return;
+            AU_LOCK(); n = au_done_n; memcpy(q, au_done_q, sizeof q); au_done_n = 0; AU_UNLOCK();
+            for (i = 0; i < n; i++) {
+              void *f = mod_find(dg, "Java_com_joybits_openframeworks_OFAndroidApp_playerCompleted");
+              L("[audio] musik selesai -> playerCompleted(%p)\n", (void *)(intptr_t)q[i]);
+              if (f) ((void (*)(void *, void *, int64_t))f)(g_nenv, mk_handle("com/joybits/openframeworks/OFAndroidApp"), q[i]);
+            }
+          }
+
           static void pump_resources(Mod *dg) {
             int guard = 0;
             g_dgmod = dg;
+            au_pump(dg);
             while (g_resq_n > 0 && guard++ < 256) {
               ResReq rq = g_resq[0];
               memmove(&g_resq[0], &g_resq[1], sizeof(ResReq) * (size_t)(--g_resq_n));
@@ -2139,6 +2415,7 @@ jobs:
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--audio") && i + 1 < argc) g_audio = pint(argv[++i]) != 0;
               else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
               else if (!strcmp(argv[i], "--splashack") && i + 1 < argc) { const char *z = argv[++i]; g_splash_delay = (*z == '-') ? -1 : pint(z); }
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
@@ -2148,7 +2425,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.7-touch) ==\n");
+            L("== doodleloader (Milestone 3.8-audio) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
@@ -2379,6 +2656,7 @@ jobs:
 
       - name: Kompilasi (aarch64)
         run: |
+          curl -fsSL https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h -o src/minimp3.h || echo "PERINGATAN: minimp3.h gagal diunduh -> build tanpa suara"
           (cd src && python3 gen_stubs.py)
           aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/doodle_god/elfprobe64 src/elfprobe64.c -ldl
           aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Wno-format-truncation -Isrc -o out/doodle_god/doodleloader src/doodleloader.c -ldl -lpthread -lm
