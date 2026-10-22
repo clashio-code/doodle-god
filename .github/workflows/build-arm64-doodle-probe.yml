@@ -991,7 +991,7 @@ jobs:
                 closedir(d);
               }
             }
-            if (g_dirlog++ < 20) L("[java] listDir(\"%s\") -> %d entri (prefix APK \"%s\")\n", path, nfound, pre);
+            if (g_dirlog++ < 20) L("[java] listDir(\"%s\") -> %d entri (prefix APK \"%s\"): %.300s\n", path, nfound, pre, out);
             return out;
           }
 
@@ -1551,6 +1551,17 @@ jobs:
           }
           static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
 
+          static void apk_diag(const char *full) {
+            static int once;
+            int i, shown = 0;
+            const char *b = strrchr(full, '/');
+            b = b ? b + 1 : full;
+            if (!once++) { L("[apk] 10 entri pertama:"); for (i = 0; i < g_nents && i < 10; i++) L(" %s", g_ents[i].name); L("\n"); }
+            for (i = 0; i < g_nents && shown < 5; i++)
+              if (strstr(g_ents[i].name, b)) { L("[apk] mirip '%s': %s (method=%u csize=%u usize=%u)\n", b, g_ents[i].name, g_ents[i].method, g_ents[i].csize, g_ents[i].usize); shown++; }
+            if (!shown) L("[apk] tidak ada entri yang mengandung '%s'\n", b);
+          }
+
           typedef void (*nf_rescb_t)(void *, void *, int64_t, void *, int);
           /* jawab antrean loadResource seperti Java: baca aset dari APK (atau disk), panggil GameService.loadResourceCallback(ptr, byte[], len) tepat sekali per ptr */
           static void pump_resources(Mod *dg) {
@@ -1585,7 +1596,14 @@ jobs:
                 }
               }
               if (buf) { if (g_asset_ok++ < 100) L("[res] %s -> %ld byte\n", rq.path, n); }
-              else { n = 0; if (g_asset_miss++ < 100) L("[res] %s -> TIDAK ADA (APK maupun disk), kirim kosong\n", rq.path); }
+              else {
+                n = 0;
+                if (g_asset_miss++ < 100) {
+                  L("[res] %s -> TIDAK ADA (APK maupun disk), kirim kosong | dicari: %s\n", rq.path, full);
+                  if (e) L("[res] entri ada di APK tapi apk_read gagal: method=%u csize=%u usize=%u loff=%u\n", e->method, e->csize, e->usize, e->loff);
+                  else apk_diag(full);
+                }
+              }
               arr = mk_array(1, (int)n);
               if (arr && buf && n > 0) memcpy(arr_get(arr)->data, buf, (size_t)n);
               free(buf);
