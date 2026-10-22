@@ -744,6 +744,38 @@ jobs:
             return dl_iterate_phdr(cb, data);
           }
 
+          /* ---------- penskalaan layar ----------
+           * APK hanya membawa aset 1366x768 (assets/aspect/1366x768, assets/resolution/1366x768), sedangkan layar device 640x480.
+           * Game dibohongi: surfaceChanged(1366,768). glViewport/glScissor dari game diskalakan ke jendela asli (letterbox/stretch),
+           * sentuhan/kursor dipetakan balik ke koordinat game. Matikan dengan --size 0x0. */
+          static int g_gw = 1366, g_gh = 768;      /* ukuran yang dilaporkan ke game; 0 = ukuran asli */
+          static int g_ww = 640, g_wh = 480;       /* ukuran jendela asli */
+          static int g_fit_stretch;
+          static float g_gs_x = 1.f, g_gs_y = 1.f;
+          static int g_gox, g_goy;
+          static void (*r_glViewport)(int, int, int, int);
+          static void (*r_glScissor)(int, int, int, int);
+          static void gs_setup(void) {
+            float sx = (float)g_ww / (float)g_gw, sy = (float)g_wh / (float)g_gh;
+            if (g_fit_stretch) { g_gs_x = sx; g_gs_y = sy; g_gox = 0; g_goy = 0; }
+            else {
+              float k = sx < sy ? sx : sy;
+              g_gs_x = k; g_gs_y = k;
+              g_gox = (int)(((float)g_ww - (float)g_gw * k) / 2.f);
+              g_goy = (int)(((float)g_wh - (float)g_gh * k) / 2.f);
+            }
+          }
+          static void b_glViewport(int x, int y, int w, int h) {
+            if (!r_glViewport) *(void **)&r_glViewport = h_gles ? dlsym(h_gles, "glViewport") : NULL;
+            if (r_glViewport) r_glViewport(g_gox + (int)((float)x * g_gs_x + .5f), g_goy + (int)((float)y * g_gs_y + .5f), (int)((float)w * g_gs_x + .5f), (int)((float)h * g_gs_y + .5f));
+          }
+          static void b_glScissor(int x, int y, int w, int h) {
+            if (!r_glScissor) *(void **)&r_glScissor = h_gles ? dlsym(h_gles, "glScissor") : NULL;
+            if (r_glScissor) r_glScissor(g_gox + (int)((float)x * g_gs_x + .5f), g_goy + (int)((float)y * g_gs_y + .5f), (int)((float)w * g_gs_x + .5f), (int)((float)h * g_gs_y + .5f));
+          }
+          static float to_gx(float wx) { return (wx - (float)g_gox) / g_gs_x; }
+          static float to_gy(float wy) { return (wy - (float)g_goy) / g_gs_y; }
+
           typedef struct { const char *name; void *addr; } Shim;
           static const Shim shim[] = {
             {"__errno", (void *)b_errno}, {"__android_log_print", (void *)b_android_log_print}, {"__android_log_vprint", (void *)b_android_log_vprint},
@@ -757,6 +789,7 @@ jobs:
             {"AAsset_close", (void *)b_AAsset_close}, {"AAsset_seek", (void *)b_AAsset_seek}, {"AAsset_seek64", (void *)b_AAsset_seek},
             {"AAsset_getBuffer", (void *)b_AAsset_getBuffer}, {"AAsset_getRemainingLength", (void *)b_AAsset_getRemainingLength},
             {"AAsset_getRemainingLength64", (void *)b_AAsset_getRemainingLength},
+            {"glViewport", (void *)b_glViewport}, {"glScissor", (void *)b_glScissor},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -1522,12 +1555,12 @@ jobs:
                 float v = (float)(*(int16_t *)(ev + 16)) / 32768.f;
                 if (v > -0.2f && v < 0.2f) v = 0.f;
                 if (ev[12] == 0) g_ax = v; else if (ev[12] == 1) g_ay = v;
-              } else if (t == 0x401) { g_cx = (float)*(int32_t *)(ev + 20); g_cy = (float)*(int32_t *)(ev + 24); tap_down(g_cx, g_cy); }    /* MOUSEBUTTONDOWN */
-              else if (t == 0x402) tap_up((float)*(int32_t *)(ev + 20), (float)*(int32_t *)(ev + 24));
-              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = (float)*(int32_t *)(ev + 20); g_cy = (float)*(int32_t *)(ev + 24); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
-              else if (t == 0x700) { g_cx = *(float *)(ev + 24) * (float)g_sw; g_cy = *(float *)(ev + 28) * (float)g_sh; tap_down(g_cx, g_cy); }   /* FINGERDOWN */
-              else if (t == 0x701) tap_up(*(float *)(ev + 24) * (float)g_sw, *(float *)(ev + 28) * (float)g_sh);
-              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = *(float *)(ev + 24) * (float)g_sw; g_cy = *(float *)(ev + 28) * (float)g_sh; nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+              } else if (t == 0x401) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); tap_down(g_cx, g_cy); }    /* MOUSEBUTTONDOWN */
+              else if (t == 0x402) tap_up(to_gx((float)*(int32_t *)(ev + 20)), to_gy((float)*(int32_t *)(ev + 24)));
+              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+              else if (t == 0x700) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); tap_down(g_cx, g_cy); }   /* FINGERDOWN */
+              else if (t == 0x701) tap_up(to_gx(*(float *)(ev + 24) * (float)g_ww), to_gy(*(float *)(ev + 28) * (float)g_wh));
+              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
             }
             dx = g_ax + (float)(g_dp[3] - g_dp[2]); dy = g_ay + (float)(g_dp[1] - g_dp[0]);
             if (dx != 0.f || dy != 0.f) {
@@ -1625,6 +1658,12 @@ jobs:
             nf_backPressed = (nf_ret_t)nfind(dg, "backPressed");
             if (!nf_init || !nf_resume || !nf_surfaceChanged || !nf_surfaceCreated || !nf_render) return 1;
             if (gl_init(&w, &h) != 0) { L("GL gagal, berhenti.\n"); return 1; }
+            g_ww = w; g_wh = h;
+            if (g_gw > 0 && g_gh > 0 && (g_gw != w || g_gh != h)) {
+              gs_setup();
+              L("[scale] jendela %dx%d -> game mengira %dx%d | mode=%s skala=%.4f/%.4f offset=%d,%d\n", w, h, g_gw, g_gh, g_fit_stretch ? "stretch" : "letterbox", (double)g_gs_x, (double)g_gs_y, g_gox, g_goy);
+              w = g_gw; h = g_gh;
+            } else g_gw = 0;
             g_sw = w; g_sh = h; g_cx = (float)w / 2.f; g_cy = (float)h / 2.f;
             pad_init();
             g_nenv = (void *)&g_envobj;
@@ -1738,6 +1777,8 @@ jobs:
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
+              else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_gw = pint(z); while (*z >= '0' && *z <= '9') z++; g_gh = *z == 'x' ? pint(z + 1) : 0; }
+              else if (!strcmp(argv[i], "--fit") && i + 1 < argc) g_fit_stretch = !strcmp(argv[++i], "stretch");
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
