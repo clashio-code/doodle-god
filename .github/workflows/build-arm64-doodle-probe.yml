@@ -1041,7 +1041,28 @@ jobs:
               buf[i] = 0;
               return buf;
             }
-            if (!strcmp(m->name, "listDir") || !strcmp(m->name, "getDirList")) return dir_csv(h2s(a[0].l), buf, sizeof buf);
+            if (!strcmp(m->name, "getDirList")) return dir_csv(h2s(a[0].l), buf, sizeof buf);   /* AndroidDevice::getDirList mem-parse CSV */
+          if (!strcmp(m->name, "listDir")) {   /* ofxDirList::listDir mem-parse hasilnya sebagai JSON: ["nama1","nama2"] (Json::get + asString) */
+            static char csv[65536];
+            static int jlog;
+            const char *c = dir_csv(h2s(a[0].l), csv, sizeof csv), *e;
+            size_t o = 0;
+            buf[o++] = '[';
+            while (*c && o + 300 < sizeof buf) {
+              e = strchr(c, ',');
+              if (!e) break;
+              if (e > c) {
+                if (o > 1) buf[o++] = ',';
+                o += (size_t)snprintf(buf + o, sizeof buf - o, "\"%.*s\"", (int)(e - c), c);
+              }
+              c = strchr(e, '\n');
+              if (!c) break;
+              c++;
+            }
+            buf[o++] = ']'; buf[o] = 0;
+            if (jlog++ < 20) L("[java] listDir JSON: %.200s\n", buf);
+            return buf;
+          }
             return jstr_default(m->name);
           }
 
