@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3.4 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.5 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -801,6 +801,92 @@ jobs:
           static float to_gx(float wx) { return (wx - (float)g_gox) / g_gs_x; }
           static float to_gy(float wy) { return (wy - (float)g_goy) / g_gs_y; }
 
+                    /* ---------- diagnostik GL: hitung draw/tekstur + tangkap layar ke PNG ---------- */
+          static unsigned g_n_draw, g_n_tex;
+          static void (*r_glDrawArrays)(unsigned, int, int);
+          static void (*r_glDrawElements)(unsigned, int, unsigned, const void *);
+          static void (*r_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+          static void (*r_glReadPixels)(int, int, int, int, unsigned, unsigned, void *);
+          static void b_glDrawArrays(unsigned m, int f, int c) {
+            g_n_draw++;
+            if (!r_glDrawArrays) *(void **)&r_glDrawArrays = h_gles ? dlsym(h_gles, "glDrawArrays") : NULL;
+            if (r_glDrawArrays) r_glDrawArrays(m, f, c);
+          }
+          static void b_glDrawElements(unsigned m, int c, unsigned t, const void *i) {
+            g_n_draw++;
+            if (!r_glDrawElements) *(void **)&r_glDrawElements = h_gles ? dlsym(h_gles, "glDrawElements") : NULL;
+            if (r_glDrawElements) r_glDrawElements(m, c, t, i);
+          }
+          static void b_glTexImage2D(unsigned tg, int lv, int ifmt, int w, int h, int b, unsigned fmt, unsigned ty, const void *px) {
+            g_n_tex++;
+            if (!r_glTexImage2D) *(void **)&r_glTexImage2D = h_gles ? dlsym(h_gles, "glTexImage2D") : NULL;
+            if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px);
+          }
+          static unsigned png_crc(unsigned c, const unsigned char *p, size_t n) {
+            static unsigned tab[256];
+            static int init;
+            size_t i;
+            if (!init) { unsigned k, j; for (k = 0; k < 256; k++) { unsigned v = k; for (j = 0; j < 8; j++) v = (v & 1) ? 0xedb88320u ^ (v >> 1) : v >> 1; tab[k] = v; } init = 1; }
+            c = ~c;
+            for (i = 0; i < n; i++) c = tab[(c ^ p[i]) & 255] ^ (c >> 8);
+            return ~c;
+          }
+          static void png_put32(unsigned char *o, unsigned v) { o[0] = (unsigned char)(v >> 24); o[1] = (unsigned char)(v >> 16); o[2] = (unsigned char)(v >> 8); o[3] = (unsigned char)v; }
+          static void png_chunk(FILE *f, const char *type, const unsigned char *d, unsigned n) {
+            unsigned char hd[8], cr[4];
+            unsigned c;
+            png_put32(hd, n); memcpy(hd + 4, type, 4);
+            fwrite(hd, 1, 8, f);
+            if (n) fwrite(d, 1, n, f);
+            c = png_crc(0, (const unsigned char *)type, 4);
+            if (n) c = png_crc(c, d, n);
+            png_put32(cr, c); fwrite(cr, 1, 4, f);
+          }
+          /* PNG tanpa kompresi (blok deflate "stored"); rgba = piksel dari glReadPixels (baris paling bawah dulu) */
+          static int png_write(const char *path, const unsigned char *rgba, int w, int h) {
+            size_t rawn = (size_t)h * (1 + (size_t)w * 3), nblk = (rawn + 65534) / 65535, zn = 2 + nblk * 5 + rawn + 4, pos = 0, o = 0, y;
+            unsigned char *raw = malloc(rawn), *z = malloc(zn), ihdr[13];
+            unsigned a = 1, b = 0;
+            FILE *f;
+            if (!raw || !z) { free(raw); free(z); return -1; }
+            for (y = 0; y < (size_t)h; y++) {
+              const unsigned char *s = rgba + (size_t)(h - 1 - (int)y) * (size_t)w * 4;
+              int x;
+              raw[pos++] = 0;
+              for (x = 0; x < w; x++) { raw[pos++] = s[x * 4]; raw[pos++] = s[x * 4 + 1]; raw[pos++] = s[x * 4 + 2]; }
+            }
+            for (pos = 0; pos < rawn; pos++) { a = (a + raw[pos]) % 65521u; b = (b + a) % 65521u; }
+            z[o++] = 0x78; z[o++] = 0x01;
+            for (pos = 0; pos < rawn; ) {
+              size_t n = rawn - pos > 65535 ? 65535 : rawn - pos;
+              z[o++] = (pos + n >= rawn) ? 1 : 0;
+              z[o++] = (unsigned char)(n & 255); z[o++] = (unsigned char)(n >> 8);
+              z[o++] = (unsigned char)(~n & 255); z[o++] = (unsigned char)((~n >> 8) & 255);
+              memcpy(z + o, raw + pos, n); o += n; pos += n;
+            }
+            png_put32(z + o, (b << 16) | a); o += 4;
+            png_put32(ihdr, (unsigned)w); png_put32(ihdr + 4, (unsigned)h);
+            ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+            f = fopen(path, "wb");
+            if (!f) { free(raw); free(z); return -1; }
+            fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+            png_chunk(f, "IHDR", ihdr, 13); png_chunk(f, "IDAT", z, (unsigned)o); png_chunk(f, "IEND", NULL, 0);
+            fclose(f); free(raw); free(z);
+            return 0;
+          }
+          static void screenshot(int frame) {
+            char nm[64];
+            unsigned char *px;
+            if (!r_glReadPixels) *(void **)&r_glReadPixels = h_gles ? dlsym(h_gles, "glReadPixels") : NULL;
+            if (!r_glReadPixels) { L("[shot] glReadPixels tidak ada\n"); return; }
+            px = malloc((size_t)g_ww * (size_t)g_wh * 4);
+            if (!px) return;
+            r_glReadPixels(0, 0, g_ww, g_wh, 0x1908, 0x1401, px);
+            snprintf(nm, sizeof nm, "shot_%d.png", frame);
+            L("[shot] %s %dx%d -> %s\n", nm, g_ww, g_wh, png_write(nm, px, g_ww, g_wh) == 0 ? "OK" : "GAGAL");
+            free(px);
+          }
+
           typedef struct { const char *name; void *addr; } Shim;
           static const Shim shim[] = {
             {"__errno", (void *)b_errno}, {"__android_log_print", (void *)b_android_log_print}, {"__android_log_vprint", (void *)b_android_log_vprint},
@@ -815,6 +901,7 @@ jobs:
             {"AAsset_getBuffer", (void *)b_AAsset_getBuffer}, {"AAsset_getRemainingLength", (void *)b_AAsset_getRemainingLength},
             {"AAsset_getRemainingLength64", (void *)b_AAsset_getRemainingLength},
             {"glViewport", (void *)b_glViewport}, {"glScissor", (void *)b_glScissor},
+            {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -1811,6 +1898,24 @@ jobs:
             doc = mk_handle(g_docpath);
 
             L("\n== siklus hidup game (stage 3) ==\n");
+
+          {
+            int i, nj = 0, nc = 0, nd = 0;
+            L("\n== ekspor Java_* di libdoodle-everything.so (callback yang bisa dipanggil dari Java) ==\n");
+            for (i = 1; i < dg->nsym; i++) {
+              const Elf64_Sym *s = &dg->sym[i];
+              if (s->st_shndx == SHN_UNDEF || !s->st_name || strncmp(dg->str + s->st_name, "Java_", 5) != 0) continue;
+              L("  %s\n", dg->str + s->st_name + 5); nj++;
+            }
+            L("total Java_*: %d\n\n== APK: entri bernama 'onfig' dan isi assets/data/ ==\n", nj);
+            for (i = 0; i < g_nents; i++) {
+              const char *nm = g_ents[i].name;
+              if (strstr(nm, "onfig") && nc++ < 60) L("  %s (%u byte, metode %u)\n", nm, g_ents[i].usize, g_ents[i].method);
+              if (!strncmp(nm, "assets/data/", 12)) { if (nd++ < 40) L("  data: %s\n", nm); }
+            }
+            L("  entri 'onfig': %d | entri assets/data/: %d\n", nc, nd);
+          }
+
             L("[game] OFAndroidApp.init(GameService, \"%s\")\n", g_docpath);
             nf_init(g_nenv, g_ncls, gs, doc);               L("[game] init selesai\n"); gl_check("init");
             L("[game] OFAndroidApp.resume(false)\n");
@@ -1827,8 +1932,9 @@ jobs:
               pump_events();
               pump_resources(dg);
               nf_render(g_nenv, g_ncls);
+              if (f == 120 || f == 600) screenshot(f);   /* baca back buffer SEBELUM swap */
               p_SDL_GL_SwapWindow(g_win);
-              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai\n", f); gl_check("render"); }
+              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u\n", f, g_n_draw, g_n_tex); gl_check("render"); }
               next += step; n = now_ns();
               if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
             }
@@ -1948,7 +2054,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.4) ==\n");
+            L("== doodleloader (Milestone 3.5) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
@@ -2174,7 +2280,7 @@ jobs:
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH2
-          echo "--stage 3 --frames 600 --timeout 120 --sc 1" > out/doodle_god/loader.args
+          echo "--stage 3 --frames 700 --timeout 120 --sc 1" > out/doodle_god/loader.args
           echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
