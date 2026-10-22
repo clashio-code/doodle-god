@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.2 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -505,8 +505,41 @@ jobs:
             }
             fclose(m);
           }
+          /* kandidat return address di modul game, dipindai dari sp ke atas sampai ujung peta stack (maks maxwords kata).
+           * Berguna saat abort karena exception C++ tak tertangkap: frame pelempar masih ada di stack (belum di-unwind). */
+          static void stack_candidates(uintptr_t sp, int maxwords, int maxshow, const char *tag) {
+            uintptr_t end = sp + (uintptr_t)maxwords * 8, lo, hi;
+            const uintptr_t *s = (const uintptr_t *)sp;
+            int k, shown = 0;
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            if (m) {
+              while (fgets(ln, sizeof ln, m)) {
+                const char *q = ln;
+                lo = 0; hi = 0;
+                while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) lo = lo * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+                if (*q == '-') q++;
+                while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) hi = hi * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+                if (sp >= lo && sp < hi) { if (hi < end) end = hi; break; }
+              }
+              fclose(m);
+            }
+            L("  [stack%s] pindai sp=%p .. %p (%ld kata) untuk return address di modul game:\n", tag, (void *)sp, (void *)end, (long)((end - sp) / 8));
+            for (k = 0; sp + (uintptr_t)k * 8 + 8 <= end && shown < maxshow; k++) {
+              int i;
+              for (i = 0; i < nmods; i++)
+                if (s[k] >= (uintptr_t)mods[i].base && s[k] < (uintptr_t)mods[i].base + mods[i].span) {
+                  uint64_t d = 0; const char *nm = game_sym(&mods[i], s[k], &d);
+                  L("    sp+%d: %s + 0x%llx  [%s+0x%llx]\n", k * 8, mods[i].name, (unsigned long long)(s[k] - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
+                  shown++; break;
+                }
+            }
+            if (!shown) L("    (tidak ada)\n");
+          }
+          static volatile int g_in_sig;
           static void on_sig(int sig, siginfo_t *si, void *ctx) {
             ucontext_t *uc = (ucontext_t *)ctx;
+            if (g_in_sig++) _exit(128 + sig);   /* crash di dalam handler (mis. heap rusak): jangan berulang/menggantung */
             uintptr_t pc = 0, lr = 0, sp = 0;
             (void)uc; (void)sp; (void)lr;
           #if defined(__aarch64__)
@@ -528,19 +561,7 @@ jobs:
                 for (k = 0; k < 16; k++) { if (k % 4 == 0) L("\n   "); L(" %08x", c[k]); }
                 L("\n");
               }
-              {
-                const uintptr_t *s = (const uintptr_t *)sp; int shown = 0;
-                L("  [stack] kandidat return address di modul game:\n");
-                for (k = 0; k < 256 && shown < 24; k++) {
-                  int i;
-                  for (i = 0; i < nmods; i++)
-                    if (s[k] >= (uintptr_t)mods[i].base && s[k] < (uintptr_t)mods[i].base + mods[i].span) {
-                      uint64_t d = 0; const char *nm = game_sym(&mods[i], s[k], &d);
-                      L("    sp+%d: %s + 0x%llx  [%s+0x%llx]\n", k * 8, mods[i].name, (unsigned long long)(s[k] - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
-                      shown++; break;
-                    }
-                }
-              }
+              stack_candidates(sp, 24576, 80, "");
             }
           #endif
             _exit(128 + sig);
@@ -585,7 +606,10 @@ jobs:
             L("\n*** ASSERT bionic: %s:%d (%s): %s ***\n", file, line, func, msg);
             abort();
           }
-          static void b_set_abort_message(const char *msg) { L("[droid] android_set_abort_message: %s\n", msg ? msg : "(null)"); }
+          static void b_set_abort_message(const char *msg) {
+            L("[droid] android_set_abort_message: %s\n", msg ? msg : "(null)");
+            if (msg && strstr(msg, "uncaught exception")) stack_candidates((uintptr_t)__builtin_frame_address(0), 24576, 80, " abort");
+          }
           static int b_system_property_get(const char *name, char *value) {
             static int n;
             const char *v = "";
@@ -626,6 +650,7 @@ jobs:
           }
 
           static int apk_open(const char *path) {
+            if (g_nents > 0) return 0;    /* sudah terbuka (idempoten: mencegah penulisan melewati array g_ents) */
             struct stat st;
             unsigned char *tail, *cd;
             size_t tl, cdsize, k;
@@ -949,17 +974,29 @@ jobs:
           /* parse manual: JANGAN atoi/strtol (terikat GLIBC_2.38) */
           static long long jparse(const char *s) { long long v = 0; int neg = 0; if (*s == '-') { neg = 1; s++; } while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return neg ? -v : v; }
 
-          /* DEFAULT TEBAKAN: ganti dengan nilai asli dari GameService (jadx) lewat java_values.txt */
+          /* Nilai asli dari APK (AndroidManifest + resources.arsc + bytecode GameService); java_values.txt masih bisa menimpa. */
           static const char *jstr_default(const char *name) {
             static const struct { const char *k, *v; } d[] = {
-              { "getPackage", "com.joybits.doodleeverything" }, { "getGameID", "doodlegod" }, { "getShortGameID", "dg" },
-              { "getVersionType", "full" }, { "getOriginalVersionType", "full" }, { "getPlatform", "android" },
-              { "getRegion", "US" }, { "getCountry", "US" }, { "getVersion", "1.0" }, { "getSystemLocalizationList", "en" },
+              { "getPackage", "joybits.doodlegod_hd" }, { "getGameID", "DoodleGod" }, { "getShortGameID", "dg" },
+              { "getVersionType", "paid" }, { "getOriginalVersionType", "paid" }, { "getPlatform", "ANDROID_TABLET" }, { "getStore", "GOOGLE" },
+              { "getRegion", "US" }, { "getCountry", "US" }, { "getVersion", "3.2.13.302013" }, { "getSystemLocalizationList", "en" },
               { "getDeviceDesc", "muOS" }, { "getUDID", "muos-doodlegod-0001" }, { NULL, NULL } };
             int i;
             for (i = 0; d[i].k; i++) if (!strcmp(d[i].k, name)) return d[i].v;
             return "";
           }
+
+
+          /* resource Android (res/values) yang dibaca Java lewat GameResource.getString/getBoolean; diekstrak dari resources.arsc APK */
+          static const struct { const char *k, *v; } g_res_str[] = {
+            { "game_id", "DoodleGod" }, { "short_game_id", "dg" }, { "version_type", "paid" }, { "platform", "ANDROID_TABLET" }, { "store_id", "google" },
+            { "namePackage", "joybits.doodlegod_hd" }, { "app_name", "Doodle God HD" }, { "analytics_libs", "Firebase" }, { "need_available_ram", "180" },
+            { "orientation", "landscape" }, { "project_id", "doodle-god-hd" }, { "license_failed", "License check failed." }, { NULL, NULL } };
+          static const struct { const char *k; int v; } g_res_bool[] = {
+            { "can_send_mail", 0 }, { "consumable_fix", 0 }, { "enable_banner", 0 }, { "fast_speed_ad", 0 }, { "is_need_flush", 1 }, { "isarbor", 0 },
+            { "play_pass_version", 1 }, { "supportJoypad", 0 }, { "support_local_notification", 1 }, { "support_remote_notification", 0 }, { NULL, 0 } };
+          static const char *res_string(const char *k) { int i; for (i = 0; g_res_str[i].k; i++) if (!strcmp(g_res_str[i].k, k)) return g_res_str[i].v; return NULL; }
+          static int res_bool(const char *k, int def) { int i; for (i = 0; g_res_bool[i].k; i++) if (!strcmp(g_res_bool[i].k, k)) return g_res_bool[i].v; return def; }
 
           /* path dari game -> path di disk: absolut dipakai apa adanya, relatif di bawah folder files/ */
           static void host_path(const char *p, char *out, size_t sz) {
@@ -1063,6 +1100,12 @@ jobs:
             if (jlog++ < 20) L("[java] listDir JSON: %.200s\n", buf);
             return buf;
           }
+            if (!strcmp(m->name, "getResourceString") || !strcmp(m->name, "getResourceValue")) {
+              const char *r = res_string(h2s(a[0].l));
+              if (r) return r;
+              if (strstr(m->sig, "(Ljava/lang/String;Ljava/lang/String;)")) return h2s(a[1].l);   /* overload dengan nilai bawaan */
+              return "";
+            }
             return jstr_default(m->name);
           }
 
@@ -1078,10 +1121,16 @@ jobs:
             }
             if (!strcmp(m->name, "createDirectory")) { host_path(h2s(a[0].l), p, sizeof p); mkdir_p(p); return 1; }
             if (!strcmp(m->name, "deleteFile")) { host_path(h2s(a[0].l), p, sizeof p); unlink(p); return 1; }
+            if (!strcmp(m->name, "getResourceBoolean")) return res_bool(h2s(a[0].l), strstr(m->sig, ";Z)Z") ? a[1].i : 0);
+            if (!strcmp(m->name, "isTablet")) return 1;            /* platform = ANDROID_TABLET */
+            if (!strcmp(m->name, "isPlayPassVersion")) return 1;   /* bool/play_pass_version = true */
             return 0;
           }
 
           /* loadResource(path, ptr) dari native: diantrekan, dijawab lewat GameService.loadResourceCallback(ptr, byte[], len) oleh pump_resources() */
+          static int g_res_sync = 1;     /* Java asli: loadResource memanggil loadResourceCallback SINKRON di dalam panggilan yang sama; --resq 1 = antre */
+          static int g_lic_pending;      /* checkLicensing() -> checkLicensingCallback(true) */
+          static void res_deliver_one(const char *path, int64_t ptr);
           typedef struct { char path[512]; int64_t ptr; } ResReq;
           static ResReq g_resq[128];
           static int g_resq_n;
@@ -1118,8 +1167,10 @@ jobs:
               if (ov) { if (rt == 'J') r->j = jparse(ov); else r->i = (int)jparse(ov); }
               else if (rt == 'Z') r->i = jbool_value(m, a);
             }
+            if (rt == 'V' && !strcmp(m->name, "checkLicensing")) g_lic_pending = 1;
             if (rt == 'V' && !strcmp(m->name, "loadResource")) {
-              if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
+              if (g_res_sync) res_deliver_one(h2s(a[0].l), a[1].j);
+              else if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
               else L("[res] antrean penuh, loadResource dibuang\n");
             }
           }
@@ -1605,70 +1656,81 @@ jobs:
           }
           static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
 
-          static void apk_diag(const char *full) {
-            static int once;
-            int i, shown = 0;
-            const char *b = strrchr(full, '/');
-            b = b ? b + 1 : full;
-            if (!once++) { L("[apk] 10 entri pertama:"); for (i = 0; i < g_nents && i < 10; i++) L(" %s", g_ents[i].name); L("\n"); }
-            for (i = 0; i < g_nents && shown < 5; i++)
-              if (strstr(g_ents[i].name, b)) { L("[apk] mirip '%s': %s (method=%u csize=%u usize=%u)\n", b, g_ents[i].name, g_ents[i].method, g_ents[i].csize, g_ents[i].usize); shown++; }
-            if (!shown) L("[apk] tidak ada entri yang mengandung '%s'\n", b);
-          }
-
           typedef void (*nf_rescb_t)(void *, void *, int64_t, void *, int);
-          /* jawab antrean loadResource seperti Java: baca aset dari APK (atau disk), panggil GameService.loadResourceCallback(ptr, byte[], len) tepat sekali per ptr */
-          static void pump_resources(Mod *dg) {
+          static Mod *g_dgmod;
+          /* normalisasi path seperti Java loadResource: buang '/' depan; ekstensi json -> ".json.amr"; hasil = nama entri APK tanpa "assets/" */
+          static void res_norm_path(const char *path, char *norm, size_t sz) {
+            const char *q = path;
+            size_t nl;
+            while (*q == '/') q++;
+            snprintf(norm, sz, "%s", q);
+            nl = strlen(norm);
+            if (nl > 5 && !strcmp(norm + nl - 5, ".json") && nl + 5 < sz) strcat(norm, ".amr");
+          }
+          /* satu permintaan loadResource, persis logika Java: path "/x" -> "x"; ekstensi json -> dibaca "x.json.amr"; baca aset APK (atau disk);
+           * kalau gagal Java mengirim byte[0]; lalu GameService.loadResourceCallback(ptr, byte[], len) */
+          static void res_deliver_one(const char *path, int64_t ptr) {
             static nf_rescb_t cb;
             static int looked;
-            int guard = 0;
-            if (!looked) {
+            unsigned char *buf = NULL;
+            long n = 0;
+            void *arr;
+            char norm[700], full[760], hp[700];
+            ZEnt *e;
+            if (!looked && g_dgmod) {
               looked = 1;
-              cb = (nf_rescb_t)mod_find(dg, "Java_com_joybits_doodleeverything_GameService_loadResourceCallback");
+              cb = (nf_rescb_t)mod_find(g_dgmod, "Java_com_joybits_doodleeverything_GameService_loadResourceCallback");
               if (!cb) L("[res] loadResourceCallback TIDAK ADA\n");
             }
-            while (g_resq_n > 0 && cb && guard++ < 256) {
+            if (!cb) return;
+            res_norm_path(path, norm, sizeof norm);
+            snprintf(full, sizeof full, "assets/%s", norm);
+            e = apk_find(full);
+            if (e) buf = apk_read(e, &n);
+            if (!buf) {
+              FILE *f; host_path(path, hp, sizeof hp);
+              f = fopen(hp, "rb");
+              if (f) {
+                long sz; fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+                if (sz >= 0) { buf = malloc((size_t)sz + 1); if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz) n = sz; else { free(buf); buf = NULL; } }
+                fclose(f);
+              }
+            }
+            if (buf) { if (g_asset_ok++ < 150) L("[res] %s -> %s (%ld byte)\n", path, full, n); }
+            else {
+              n = 0;
+              if (g_asset_miss++ < 100) {
+                L("[res] %s -> TIDAK ADA (APK maupun disk), kirim byte[0] seperti Java | dicari: %s\n", path, full);
+                if (e) L("[res] entri ada di APK tapi apk_read gagal: method=%u csize=%u usize=%u loff=%u\n", e->method, e->csize, e->usize, e->loff);
+              }
+            }
+            arr = mk_array(1, (int)n);
+            if (arr && buf && n > 0) memcpy(arr_get(arr)->data, buf, (size_t)n);
+            free(buf);
+            cb(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), ptr, arr, (int)n);
+            arr_free(arr);
+          }
+
+          /* dipanggil tiap frame: antrean loadResource (mode --resq 1) dan jawaban lisensi */
+          static void pump_resources(Mod *dg) {
+            int guard = 0;
+            g_dgmod = dg;
+            while (g_resq_n > 0 && guard++ < 256) {
               ResReq rq = g_resq[0];
-              unsigned char *buf = NULL;
-              long n = 0;
-              void *arr;
-              const char *q = rq.path;
-              char full[700], hp[700];
-              ZEnt *e;
               memmove(&g_resq[0], &g_resq[1], sizeof(ResReq) * (size_t)(--g_resq_n));
-              while (*q == '/') q++;
-              snprintf(full, sizeof full, "assets/%s", q);
-              e = apk_find(full);
-              if (e) buf = apk_read(e, &n);
-              if (!buf) {
-                FILE *f; host_path(rq.path, hp, sizeof hp);
-                f = fopen(hp, "rb");
-                if (f) {
-                  long sz; fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-                  if (sz >= 0) { buf = malloc((size_t)sz + 1); if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz) n = sz; else { free(buf); buf = NULL; } }
-                  fclose(f);
-                }
-              }
-              if (buf) { if (g_asset_ok++ < 100) L("[res] %s -> %ld byte\n", rq.path, n); }
-              else {
-                n = 0;
-                if (g_asset_miss++ < 100) {
-                  L("[res] %s -> TIDAK ADA (APK maupun disk), kirim kosong | dicari: %s\n", rq.path, full);
-                  if (e) L("[res] entri ada di APK tapi apk_read gagal: method=%u csize=%u usize=%u loff=%u\n", e->method, e->csize, e->usize, e->loff);
-                  else apk_diag(full);
-                }
-              }
-              arr = mk_array(1, (int)n);
-              if (arr && buf && n > 0) memcpy(arr_get(arr)->data, buf, (size_t)n);
-              free(buf);
-              cb(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), rq.ptr, arr, (int)n);
-              arr_free(arr);
+              res_deliver_one(rq.path, rq.ptr);
+            }
+            if (g_lic_pending) {
+              void *f = mod_find(dg, "Java_com_joybits_doodleeverything_GameService_checkLicensingCallback");
+              g_lic_pending = 0;
+              if (f) { L("[game] GameService.checkLicensingCallback(true)\n"); ((void (*)(void *, void *, int))f)(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), 1); }
             }
           }
 
           /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
            * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
           static int run_game(Mod *dg, int frames, int sc) {
+            g_dgmod = dg;
             int w = 640, h = 480, f;
             long long next, t0, step = 16666667LL;
             void *gs, *doc;
@@ -1755,6 +1817,32 @@ jobs:
               if (!strcmp(h2s(cls), "com/joybits/Test") && minfo[0].count == 1 && n0 >= 1 && !strcmp(((fn_utf_t)tbl[169])(env, s, NULL), "halo") && tbl[4] && ((int (*)(void *))tbl[4])(env) == 0x10006) L("  JNI via tabel (FindClass/GetMethodID/NewStringUTF/CallVoidMethod): LULUS\n");
               else { L("  JNI via tabel: GAGAL\n"); ok = 0; }
             }
+            {  /* nilai Java asli + aturan path loadResource */
+              MInfo mm; jv aa[2]; char nb[700]; char dbuf[2048];
+              memset(&mm, 0, sizeof mm); memset(aa, 0, sizeof aa);
+              snprintf(mm.cls, sizeof mm.cls, "com/joybits/doodleeverything/GameService");
+              snprintf(mm.name, sizeof mm.name, "getGameID"); snprintf(mm.sig, sizeof mm.sig, "()Ljava/lang/String;");
+              if (!strcmp(jstr_value(&mm, aa), "DoodleGod")) L("  Java getGameID = DoodleGod: LULUS\n"); else { L("  Java getGameID: GAGAL\n"); ok = 0; }
+              snprintf(mm.name, sizeof mm.name, "getVersion");
+              if (!strcmp(jstr_value(&mm, aa), "3.2.13.302013")) L("  Java getVersion = 3.2.13.302013: LULUS\n"); else { L("  Java getVersion: GAGAL\n"); ok = 0; }
+              snprintf(mm.name, sizeof mm.name, "getResourceString"); snprintf(mm.sig, sizeof mm.sig, "(Ljava/lang/String;)Ljava/lang/String;");
+              aa[0].l = mk_handle("platform");
+              if (!strcmp(jstr_value(&mm, aa), "ANDROID_TABLET")) L("  Java getResourceString(platform): LULUS\n"); else { L("  getResourceString: GAGAL\n"); ok = 0; }
+              snprintf(mm.name, sizeof mm.name, "getResourceBoolean"); snprintf(mm.sig, sizeof mm.sig, "(Ljava/lang/String;)Z");
+              aa[0].l = mk_handle("supportJoypad");
+              if (jbool_value(&mm, aa) == 0) { aa[0].l = mk_handle("play_pass_version"); if (jbool_value(&mm, aa) == 1) L("  Java getResourceBoolean: LULUS\n"); else { L("  getResourceBoolean(play_pass_version): GAGAL\n"); ok = 0; } } else { L("  getResourceBoolean(supportJoypad): GAGAL\n"); ok = 0; }
+              res_norm_path("/data/ios.json", nb, sizeof nb);
+              if (!strcmp(nb, "data/ios.json.amr")) L("  res_norm_path(/data/ios.json) -> data/ios.json.amr: LULUS\n"); else { L("  res_norm_path: GAGAL (%s)\n", nb); ok = 0; }
+              res_norm_path("/data/reactions_1.txt", nb, sizeof nb);
+              if (!strcmp(nb, "data/reactions_1.txt")) L("  res_norm_path(.txt tidak berubah): LULUS\n"); else { L("  res_norm_path txt: GAGAL\n"); ok = 0; }
+              if (g_nents == 0 && access(g_apk_arg, R_OK) == 0) { zlib_load(); apk_open(g_apk_arg); }
+              if (g_nents > 0) {
+                char full[760]; res_norm_path("/data/ios.json", nb, sizeof nb); snprintf(full, sizeof full, "assets/%s", nb);
+                if (apk_find(full)) L("  entri APK %s ada: LULUS\n", full); else { L("  entri APK %s TIDAK ADA: GAGAL\n", full); ok = 0; }
+                dir_csv("aspect", dbuf, sizeof dbuf);
+                if (!strcmp(dbuf, "1366x768,d\n")) L("  dir_csv(aspect) = 1366x768,d: LULUS\n"); else { L("  dir_csv(aspect): GAGAL (%s)\n", dbuf); ok = 0; }
+              }
+            }
             if (access(g_apk_arg, R_OK) == 0) {   /* tes pembaca APK + inflate dengan CRC32 dari zip */
               int i, tested = 0, bad = 0, stored = 0, defl = 0;
               long len = 0;
@@ -1797,13 +1885,14 @@ jobs:
               else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
               else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_gw = pint(z); while (*z >= '0' && *z <= '9') z++; g_gh = *z == 'x' ? pint(z + 1) : 0; }
               else if (!strcmp(argv[i], "--fit") && i + 1 < argc) g_fit_stretch = !strcmp(argv[++i], "stretch");
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3) ==\n");
+            L("== doodleloader (Milestone 3.2) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
@@ -2036,7 +2125,7 @@ jobs:
         run: |
           (cd src && python3 gen_stubs.py)
           aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/doodle_god/elfprobe64 src/elfprobe64.c -ldl
-          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Isrc -o out/doodle_god/doodleloader src/doodleloader.c -ldl -lpthread -lm
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Wno-format-truncation -Isrc -o out/doodle_god/doodleloader src/doodleloader.c -ldl -lpthread -lm
           file out/doodle_god/elfprobe64 out/doodle_god/doodleloader || true
           for B in elfprobe64 doodleloader; do
             echo "--- $B: library yang dibutuhkan:"
