@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3.6 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.5 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -1256,6 +1256,9 @@ jobs:
           /* loadResource(path, ptr) dari native: diantrekan, dijawab lewat GameService.loadResourceCallback(ptr, byte[], len) oleh pump_resources() */
           static int g_res_sync = 1;     /* Java asli: loadResource memanggil loadResourceCallback SINKRON di dalam panggilan yang sama; --resq 1 = antre */
           static int g_lic_pending;      /* checkLicensing() -> checkLicensingCallback(true) */
+          static int g_splash_pending;   /* showSplash(b) -> beberapa frame kemudian GameActivity.splashIsActive(b): konfirmasi Java yang melepas flag sibuk Splash::update */
+          static int g_splash_val;
+          static int g_splash_delay = 1; /* jeda dalam frame; --splashack -1 = nonaktif */
           static void res_deliver_one(const char *path, int64_t ptr);
           typedef struct { char path[512]; int64_t ptr; } ResReq;
           static ResReq g_resq[128];
@@ -1295,6 +1298,7 @@ jobs:
                 else if (rt == 'I' && !strcmp(m->name, "hashCode") && strstr(m->cls, "Signature")) { sig_init(); r->i = g_sig_hash; }
             }
             if (rt == 'V' && !strcmp(m->name, "checkLicensing")) g_lic_pending = 1;
+            if (rt == 'V' && !strcmp(m->name, "showSplash") && g_splash_delay >= 0) { g_splash_val = a[0].i & 0xff; g_splash_pending = g_splash_delay + 1; }
             if (rt == 'V' && !strcmp(m->name, "loadResource")) {
               if (g_res_sync) res_deliver_one(h2s(a[0].l), a[1].j);
               else if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
@@ -1868,57 +1872,15 @@ jobs:
               g_lic_pending = 0;
               if (f) { L("[game] GameService.checkLicensingCallback(true)\n"); ((void (*)(void *, void *, int))f)(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), 1); }
             }
+            if (g_splash_pending > 0 && --g_splash_pending == 0) {
+              void *f = mod_find(dg, "Java_com_joybits_doodleeverything_GameActivity_splashIsActive");
+              if (f) { L("[game] GameActivity.splashIsActive(%d) (konfirmasi setelah showSplash)\n", g_splash_val); ((void (*)(void *, void *, int))f)(g_nenv, mk_handle("com/joybits/doodleeverything/GameActivity"), g_splash_val); }
+              else L("[game] GameActivity.splashIsActive TIDAK ADA\n");
+            }
           }
 
           /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
            * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
-          /* ---------- callback manual Java->native dari callbacks.txt (uji coba tanpa build ulang) ----------
-           * Baris: <frame> <nama ekspor tanpa awalan "Java_"> [arg...]   arg = angka (int/bool) atau s:teks (string). Maks 4 arg. Contoh:
-           *   0 com_joybits_doodleeverything_GameActivity_onConsentGathered 1 */
-          typedef struct { int frame, na, done; char name[160]; uint64_t a[4]; char s[4][100]; int str[4]; } CbReq;
-          static CbReq g_cb[32];
-          static int g_ncb;
-          static void cb_load(void) {
-            FILE *f = fopen("callbacks.txt", "r");
-            char ln[500];
-            if (!f) { L("[cb] callbacks.txt tidak ada (tidak ada callback manual)\n"); return; }
-            while (fgets(ln, sizeof ln, f) && g_ncb < 32) {
-              char *sp = NULL, *t = strtok_r(ln, " \t\r\n", &sp);
-              CbReq *c = &g_cb[g_ncb];
-              if (!t || t[0] == '#') continue;
-              memset(c, 0, sizeof *c);
-              c->frame = pint(t);
-              t = strtok_r(NULL, " \t\r\n", &sp);
-              if (!t) continue;
-              snprintf(c->name, sizeof c->name, "%s", t);
-              while ((t = strtok_r(NULL, " \t\r\n", &sp)) != NULL && c->na < 4) {
-                if (t[0] == 's' && t[1] == ':') { snprintf(c->s[c->na], sizeof c->s[0], "%s", t + 2); c->str[c->na] = 1; }
-                else c->a[c->na] = (uint64_t)jparse(t);
-                c->na++;
-              }
-              g_ncb++;
-            }
-            fclose(f);
-            L("[cb] %d callback manual dari callbacks.txt\n", g_ncb);
-          }
-          static void cb_fire(Mod *dg, int frame) {
-            int i, k;
-            for (i = 0; i < g_ncb; i++) {
-              CbReq *c = &g_cb[i];
-              char full[200];
-              uint64_t v[4];
-              void *fn;
-              if (c->done || c->frame != frame) continue;
-              c->done = 1;
-              snprintf(full, sizeof full, "Java_%s", c->name);
-              fn = mod_find(dg, full);
-              if (!fn) { L("[cb] frame %d: %s TIDAK ADA di ekspor\n", frame, full); continue; }
-              for (k = 0; k < 4; k++) v[k] = c->str[k] ? (uint64_t)(uintptr_t)mk_handle(c->s[k]) : c->a[k];
-              L("[cb] frame %d: memanggil %s (%d argumen, a0=%llu a1=%llu)\n", frame, c->name, c->na, (unsigned long long)c->a[0], (unsigned long long)c->a[1]);
-              ((void (*)(void *, void *, uint64_t, uint64_t, uint64_t, uint64_t))fn)(g_nenv, g_ncls, v[0], v[1], v[2], v[3]);
-              L("[cb] %s selesai\n", c->name);
-            }
-          }
           static int run_game(Mod *dg, int frames, int sc) {
             g_dgmod = dg;
             int w = 640, h = 480, f;
@@ -1972,12 +1934,10 @@ jobs:
             L("[game] OFAndroidApp.surfaceCreated(%d)\n", sc);
             nf_surfaceCreated(g_nenv, g_ncls, sc);          L("[game] surfaceCreated selesai\n"); gl_check("surfaceCreated");
 
-            cb_load();
-              L("[game] mulai loop render (%s)\n", frames > 0 ? "jumlah frame terbatas" : "sampai Select+Start / tutup");
+            L("[game] mulai loop render (%s)\n", frames > 0 ? "jumlah frame terbatas" : "sampai Select+Start / tutup");
             t0 = next = now_ns();
             for (f = 0; (frames <= 0 || f < frames) && !g_quit; f++) {
               long long n;
-              cb_fire(dg, f);
               pump_events();
               pump_resources(dg);
               nf_render(g_nenv, g_ncls);
@@ -2097,13 +2057,14 @@ jobs:
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
               else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
+              else if (!strcmp(argv[i], "--splashack") && i + 1 < argc) { const char *z = argv[++i]; g_splash_delay = (*z == '-') ? -1 : pint(z); }
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
               else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_gw = pint(z); while (*z >= '0' && *z <= '9') z++; g_gh = *z == 'x' ? pint(z + 1) : 0; }
               else if (!strcmp(argv[i], "--fit") && i + 1 < argc) g_fit_stretch = !strcmp(argv[++i], "stretch");
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.6) ==\n");
+            L("== doodleloader (Milestone 3.5-splash) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
@@ -2330,19 +2291,6 @@ jobs:
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH2
           echo "--stage 3 --frames 700 --timeout 120 --sc 1" > out/doodle_god/loader.args
-          cat > out/doodle_god/callbacks.txt <<'EOF_CB'
-          # Callback manual Java->native. Format: <frame> <nama ekspor tanpa awalan Java_> [arg...]   (arg: angka, atau s:teks untuk string, maks 4)
-          # Nama diambil dari daftar "ekspor Java_*" di loader_log.txt. Jalan sebelum render frame tsb. Edit file ini tanpa build ulang.
-          0 com_joybits_doodleeverything_GameActivity_onConsentGathered 1
-          # kandidat lain untuk dicoba (hapus tanda # satu per satu):
-          #3 com_joybits_doodleeverything_GameActivity_onHideLogo
-          #3 com_joybits_doodleeverything_GameService_pixtelInitCallback 1
-          #3 com_joybits_doodleeverything_GameService_onRemoteConfigUpdateCallback s:{}
-          #3 com_joybits_doodleeverything_GameService_onAbTestConfigUpdateCallback s:{}
-          EOF_CB
-          cat > out/doodle_god/java_values.txt <<'EOF_JV'
-          isAnalyticsProvidersReady=1
-          EOF_JV
           echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
