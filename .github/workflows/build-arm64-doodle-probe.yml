@@ -1,4 +1,4 @@
-name: build-arm64-doodle-input-debug
+name: build-arm64-doodle-probe
 on:
   workflow_dispatch:
   push:
@@ -1799,27 +1799,22 @@ jobs:
             if (!f) L("[game] titik masuk %s TIDAK ADA\n", full);
             return f;
           }
-          /* Log diagnostik: pastikan tombol A benar-benar menghasilkan event dan callback sentuh dipanggil. */
+          /* OFAndroidApp touch callbacks menerima koordinat permukaan/jendela, bukan koordinat logis game.
+           * Kursor disimpan dalam koordinat game, jadi ubah balik ke piksel drawable sebelum memanggil JNI. */
+          static float touch_px(float x) { return (float)g_gox + x * g_gs_x; }
+          static float touch_py(float y) { return (float)g_goy + y * g_gs_y; }
           static void tap_down(float x, float y) {
             if (nf_touchDown) {
-              L("[input] touchDown x=%.1f y=%.1f callback=OK\n", (double)x, (double)y);
-              nf_touchDown(g_nenv, g_ncls, 0, x, y);
-              g_touch_down = 1;
-            } else {
-              L("[input] touchDown GAGAL: callback nf_touchDown=NULL\n");
+              float px = touch_px(x), py = touch_py(y);
+              nf_touchDown(g_nenv, g_ncls, 0, px, py); g_touch_down = 1;
+              L("[input] touchDown game=(%.1f,%.1f) window=(%.1f,%.1f)\n", x, y, px, py);
             }
           }
           static void tap_up(float x, float y) {
-            if (!nf_touchUp) {
-              L("[input] touchUp GAGAL: callback nf_touchUp=NULL\n");
-              return;
-            }
-            if (g_touch_down) {
-              L("[input] touchUp x=%.1f y=%.1f callback=OK\n", (double)x, (double)y);
-              nf_touchUp(g_nenv, g_ncls, 0, x, y);
-              g_touch_down = 0;
-            } else {
-              L("[input] touchUp dilewati: tidak ada touch yang sedang ditekan\n");
+            if (nf_touchUp && g_touch_down) {
+              float px = touch_px(x), py = touch_py(y);
+              nf_touchUp(g_nenv, g_ncls, 0, px, py); g_touch_down = 0;
+              L("[input] touchUp game=(%.1f,%.1f) window=(%.1f,%.1f)\n", x, y, px, py);
             }
           }
 
@@ -1833,8 +1828,6 @@ jobs:
               else if (t == 0x653 && p_SDL_GameControllerOpen) p_SDL_GameControllerOpen(*(int32_t *)(ev + 8));   /* CONTROLLERDEVICEADDED */
               else if (t == 0x651 || t == 0x652) {                           /* CONTROLLERBUTTONDOWN / UP */
                 int down = (t == 0x651), b = ev[12];
-                L("[input] SDL_CONTROLLERBUTTON%s button=%d state=%u cursor=(%.1f,%.1f)\n",
-                  down ? "DOWN" : "UP", b, (unsigned)ev[13], (double)g_cx, (double)g_cy);
                 if (b == 0) { if (down) tap_down(g_cx, g_cy); else tap_up(g_cx, g_cy); }
                 else if (b == 1 && down && nf_backPressed) { int r = (uint8_t)nf_backPressed(g_nenv, g_ncls); L("[input] backPressed -> %d\n", r); }
                 else if (b == 4) g_btn_back = down;
@@ -1848,10 +1841,10 @@ jobs:
                 if (ev[12] == 0) g_ax = v; else if (ev[12] == 1) g_ay = v;
               } else if (t == 0x401) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); tap_down(g_cx, g_cy); }    /* MOUSEBUTTONDOWN */
               else if (t == 0x402) tap_up(to_gx((float)*(int32_t *)(ev + 20)), to_gy((float)*(int32_t *)(ev + 24)));
-              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy)); }
               else if (t == 0x700) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); tap_down(g_cx, g_cy); }   /* FINGERDOWN */
               else if (t == 0x701) tap_up(to_gx(*(float *)(ev + 24) * (float)g_ww), to_gy(*(float *)(ev + 28) * (float)g_wh));
-              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy); }
+              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy)); }
             }
             dx = g_ax + (float)(g_dp[3] - g_dp[2]); dy = g_ay + (float)(g_dp[1] - g_dp[0]);
             if (dx > 1.f) dx = 1.f;
@@ -1868,7 +1861,7 @@ jobs:
               if (g_cx > (float)g_sw) g_cx = (float)g_sw;
               if (g_cy < 0.f) g_cy = 0.f;
               if (g_cy > (float)g_sh) g_cy = (float)g_sh;
-              if (g_touch_down && nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, g_cx, g_cy);
+              if (g_touch_down && nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy));
             }
           }
 
@@ -1971,9 +1964,6 @@ jobs:
             nf_render = (nf_0_t)nfind(dg, "render"); nf_touchDown = (nf_touch_t)nfind(dg, "touchDown");
             nf_touchMoved = (nf_touch_t)nfind(dg, "touchMoved"); nf_touchUp = (nf_touch_t)nfind(dg, "touchUp");
             nf_backPressed = (nf_ret_t)nfind(dg, "backPressed");
-            L("[input] callback sentuh: down=%s moved=%s up=%s back=%s\n",
-              nf_touchDown ? "OK" : "NULL", nf_touchMoved ? "OK" : "NULL",
-              nf_touchUp ? "OK" : "NULL", nf_backPressed ? "OK" : "NULL");
             if (!nf_init || !nf_resume || !nf_surfaceChanged || !nf_surfaceCreated || !nf_render) return 1;
             if (gl_init(&w, &h) != 0) { L("GL gagal, berhenti.\n"); return 1; }
             g_ww = w; g_wh = h;
@@ -2400,5 +2390,5 @@ jobs:
       - name: Unggah hasil build
         uses: actions/upload-artifact@v4
         with:
-          name: doodle-input-debug-arm64
+          name: doodle-probe-arm64
           path: out
