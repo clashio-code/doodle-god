@@ -2238,7 +2238,27 @@ jobs:
 
           /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
            * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
+          /* log memori + kecepatan: VmRSS/VmHWM proses, MemAvailable sistem, rata-rata ms/frame sejak log terakhir */
+          static long mem_kb(const char *file, const char *key) {
+            FILE *fp = fopen(file, "r"); char ln[256]; size_t kl = strlen(key); long v = -1;
+            if (!fp) return -1;
+            while (fgets(ln, sizeof ln, fp)) {
+              if (!strncmp(ln, key, kl)) { const char *q = ln + kl; v = 0; while (*q && (*q < '0' || *q > '9')) q++; while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0'); break; }
+            }
+            fclose(fp);
+            return v;
+          }
+          static void mem_log(int f, long long *last_ns, int *last_f) {
+            long long t = now_ns();
+            double ms = (*last_f >= 0 && f > *last_f) ? (double)(t - *last_ns) / 1e6 / (double)(f - *last_f) : 0.0;
+            L("[mem] frame %d: RSS=%ld MB  puncak=%ld MB  | sistem: tersedia=%ld MB dari %ld MB | %.1f ms/frame (%.1f fps)\n", f,
+              mem_kb("/proc/self/status", "VmRSS:") / 1024, mem_kb("/proc/self/status", "VmHWM:") / 1024,
+              mem_kb("/proc/meminfo", "MemAvailable:") / 1024, mem_kb("/proc/meminfo", "MemTotal:") / 1024, ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+            *last_ns = t; *last_f = f;
+          }
+
           static int run_game(Mod *dg, int frames, int sc) {
+            long long mem_t = 0; int mem_f = -1;
             g_dgmod = dg;
             int w = 640, h = 480, f;
             long long next, t0, step = 16666667LL;
@@ -2303,6 +2323,7 @@ jobs:
               if (f == 120 || f == 600) screenshot(f);   /* baca back buffer SEBELUM swap */
               p_SDL_GL_SwapWindow(g_win);
               if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u\n", f, g_n_draw, g_n_tex); gl_check("render"); }
+              if ((f % 120) == 0) mem_log(f, &mem_t, &mem_f);
               next += step; n = now_ns();
               if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
             }
@@ -2425,7 +2446,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.8-audio) ==\n");
+            L("== doodleloader (Milestone 3.9-mem) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
