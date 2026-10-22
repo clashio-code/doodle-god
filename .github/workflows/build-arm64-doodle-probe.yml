@@ -1804,17 +1804,22 @@ jobs:
           static int g_up_wait; static float g_up_x, g_up_y;
           static float touch_px(float x) { return x; }   /* game melihat permukaan 1366x768 -> kirim koordinat game apa adanya */
           static float touch_py(float y) { return y; }
+          /* MainApp::touchDown/Moved/Up: id>=0 hanya mendaftarkan/menghapus titik di peta sentuhan; baru id<0 ("commit")
+           * meneruskan ke Application::touchDown/Moved/Up. Java asli mengirim keduanya, jadi kita juga. */
+          static void nt_down(float x, float y) { nf_touchDown(g_nenv, g_ncls, 0, x, y); nf_touchDown(g_nenv, g_ncls, -1, x, y); }
+          static void nt_move(float x, float y) { if (nf_touchMoved) { nf_touchMoved(g_nenv, g_ncls, 0, x, y); nf_touchMoved(g_nenv, g_ncls, -1, x, y); } }
+          static void nt_up(float x, float y) { nf_touchUp(g_nenv, g_ncls, 0, x, y); nf_touchUp(g_nenv, g_ncls, -1, x, y); }
           static void tap_down(float x, float y) {
             if (nf_touchDown) {
               float px = touch_px(x), py = touch_py(y);
-              nf_touchDown(g_nenv, g_ncls, 0, px, py); g_touch_down = 1;
+              nt_down(px, py); g_touch_down = 1;
               L("[input] touchDown game=(%.1f,%.1f) window=(%.1f,%.1f)\n", x, y, px, py);
             }
           }
           static void tap_up(float x, float y) {
             if (nf_touchUp && g_touch_down) {
               float px = touch_px(x), py = touch_py(y);
-              nf_touchUp(g_nenv, g_ncls, 0, px, py); g_touch_down = 0;
+              nt_up(px, py); g_touch_down = 0;
               L("[input] touchUp game=(%.1f,%.1f) window=(%.1f,%.1f)\n", x, y, px, py);
             }
           }
@@ -1843,10 +1848,10 @@ jobs:
                 if (ev[12] == 0) g_ax = v; else if (ev[12] == 1) g_ay = v;
               } else if (t == 0x401) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); tap_down(g_cx, g_cy); }    /* MOUSEBUTTONDOWN */
               else if (t == 0x402) tap_up(to_gx((float)*(int32_t *)(ev + 20)), to_gy((float)*(int32_t *)(ev + 24)));
-              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); if (nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy)); }
+              else if (t == 0x400 && g_touch_down && (*(uint32_t *)(ev + 16) & 1)) { g_cx = to_gx((float)*(int32_t *)(ev + 20)); g_cy = to_gy((float)*(int32_t *)(ev + 24)); nt_move(touch_px(g_cx), touch_py(g_cy)); }
               else if (t == 0x700) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); tap_down(g_cx, g_cy); }   /* FINGERDOWN */
               else if (t == 0x701) tap_up(to_gx(*(float *)(ev + 24) * (float)g_ww), to_gy(*(float *)(ev + 28) * (float)g_wh));
-              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy)); }
+              else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nt_move(touch_px(g_cx), touch_py(g_cy)); }
             }
             if (g_up_wait > 0 && --g_up_wait == 0) tap_up(g_up_x, g_up_y);
             dx = g_ax + (float)(g_dp[3] - g_dp[2]); dy = g_ay + (float)(g_dp[1] - g_dp[0]);
@@ -1864,7 +1869,7 @@ jobs:
               if (g_cx > (float)g_sw) g_cx = (float)g_sw;
               if (g_cy < 0.f) g_cy = 0.f;
               if (g_cy > (float)g_sh) g_cy = (float)g_sh;
-              if (g_touch_down && nf_touchMoved) nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy));
+              if (g_touch_down && nf_touchMoved) nt_move(touch_px(g_cx), touch_py(g_cy));
             }
           }
 
@@ -2143,7 +2148,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.6-touch) ==\n");
+            L("== doodleloader (Milestone 3.7-touch) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
