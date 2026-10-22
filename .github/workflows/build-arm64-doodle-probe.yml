@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3.2 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.3 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -947,6 +947,43 @@ jobs:
           }
           static void arr_free(void *h) { JArr *a = arr_get(h); if (a) { free(a->data); a->data = NULL; a->used = 0; } }
 
+          /* ---------- tanda tangan APK (PackageInfo.signatures) ----------
+           * Native cek lisensi memanggil getPackageInfo(pkg, GET_SIGNATURES).signatures[0].hashCode(). Java asli: Signature.hashCode() =
+           * Arrays.hashCode(byte[] sertifikat DER). Sertifikat diambil dari META-INF (berkas .RSA/.DSA/.EC) di APK (PKCS7: cari "a0 82 LL LL 30 82 LL LL 30 82"). */
+          static int g_sig_hash, g_sig_ready;
+          static void *g_sig_arr;
+          static void sig_init(void) {
+            int i;
+            if (g_sig_ready) return;
+            g_sig_ready = 1;
+            for (i = 0; i < g_nents && !g_sig_hash; i++) {
+              const char *nm = g_ents[i].name;
+              size_t nl = strlen(nm);
+              long len = 0, k;
+              unsigned char *b;
+              if (strncmp(nm, "META-INF/", 9) != 0 || nl < 13) continue;
+              if (strcmp(nm + nl - 4, ".RSA") && strcmp(nm + nl - 4, ".DSA") && strcmp(nm + nl - 3, ".EC")) continue;
+              b = apk_read(&g_ents[i], &len);
+              if (!b) continue;
+              for (k = 0; k + 10 < len; k++) {
+                if (b[k] == 0xa0 && b[k + 1] == 0x82 && b[k + 4] == 0x30 && b[k + 5] == 0x82 && b[k + 8] == 0x30 && b[k + 9] == 0x82) {
+                  long cl = 4 + (long)(((unsigned)b[k + 6] << 8) | b[k + 7]), j;
+                  uint32_t h = 0;
+                  if (k + 4 + cl > len) continue;
+                  for (j = 0; j < cl; j++) h = 31u * h + (uint32_t)(int32_t)(int8_t)b[k + 4 + j];
+                  g_sig_hash = (int32_t)h;
+                  L("[sig] sertifikat dari %s (%ld byte) -> hashCode=%d\n", nm, cl, g_sig_hash);
+                  break;
+                }
+              }
+              free(b);
+            }
+            if (!g_sig_hash) L("[sig] PERINGATAN: sertifikat APK tidak ketemu di META-INF (APK mungkin hanya v2/v3), hashCode=0\n");
+            g_sig_arr = mk_array(8, 1);
+            if (g_sig_arr) ((void **)arr_get(g_sig_arr)->data)[0] = mk_obj("android/content/pm/Signature");
+          }
+
+
           /* ---------- nilai balik Java: bisa di-override lewat java_values.txt (baris "namaMetode=nilai") ---------- */
           typedef struct { char key[64]; char val[256]; } JOv;
           static JOv g_jov[64];
@@ -980,7 +1017,8 @@ jobs:
               { "getPackage", "joybits.doodlegod_hd" }, { "getGameID", "DoodleGod" }, { "getShortGameID", "dg" },
               { "getVersionType", "paid" }, { "getOriginalVersionType", "paid" }, { "getPlatform", "ANDROID_TABLET" }, { "getStore", "GOOGLE" },
               { "getRegion", "US" }, { "getCountry", "US" }, { "getVersion", "3.2.13.302013" }, { "getSystemLocalizationList", "en" },
-              { "getDeviceDesc", "muOS" }, { "getUDID", "muos-doodlegod-0001" }, { NULL, NULL } };
+              { "getDeviceDesc", "muOS" }, { "getUDID", "muos-doodlegod-0001" },
+            { "getPackageName", "joybits.doodlegod_hd" }, { "getInstallerPackageName", "com.android.vending" }, { NULL, NULL } };
             int i;
             for (i = 0; d[i].k; i++) if (!strcmp(d[i].k, name)) return d[i].v;
             return "";
@@ -1166,6 +1204,7 @@ jobs:
               const char *ov = jov_get(m->name);
               if (ov) { if (rt == 'J') r->j = jparse(ov); else r->i = (int)jparse(ov); }
               else if (rt == 'Z') r->i = jbool_value(m, a);
+                else if (rt == 'I' && !strcmp(m->name, "hashCode") && strstr(m->cls, "Signature")) { sig_init(); r->i = g_sig_hash; }
             }
             if (rt == 'V' && !strcmp(m->name, "checkLicensing")) g_lic_pending = 1;
             if (rt == 'V' && !strcmp(m->name, "loadResource")) {
@@ -1210,6 +1249,7 @@ jobs:
             const char *f = h2s(fid);
             size_t n = strlen(f);
             (void)env; (void)obj;
+            if (strstr(f, ":signatures[")) { sig_init(); return g_sig_arr; }
             if (n > 18 && !strcmp(f + n - 18, "Ljava/lang/String;")) return mk_handle("");
             if (n > 1 && f[n - 1] == ';') return mk_obj("field-object");
             return NULL;
@@ -1286,6 +1326,20 @@ jobs:
             if (r && st >= 0 && n >= 0 && st + n <= r->len) memcpy(r->data + (size_t)st * (size_t)r->esz, buf, (size_t)n * (size_t)r->esz);
           }
 
+          static void *j_NewObjectArray(void *env, int n, void *cls, void *init) {
+            void *h = mk_array(8, n); (void)env; (void)cls;
+            if (h) { int i; JArr *r = arr_get(h); for (i = 0; i < n; i++) ((void **)r->data)[i] = init; }
+            return h;
+          }
+          static void *j_GetObjectArrayElement(void *env, void *a, int i) {
+            JArr *r = arr_get(a); (void)env;
+            return (r && r->esz == 8 && i >= 0 && i < r->len) ? ((void **)r->data)[i] : NULL;
+          }
+          static void j_SetObjectArrayElement(void *env, void *a, int i, void *v) {
+            JArr *r = arr_get(a); (void)env;
+            if (r && r->esz == 8 && i >= 0 && i < r->len) ((void **)r->data)[i] = v;
+          }
+
           static void init_jni(void) {
             int i;
             for (i = 0; i < 256; i++) g_jni_table[i] = jstubs[i];
@@ -1322,6 +1376,7 @@ jobs:
             g_vm_table[6] = (void *)vm_GetEnv;  g_vm_table[7] = (void *)vm_Attach;
             g_jni_table[32] = (void *)j_IsInstanceOf;
             g_jni_table[171] = (void *)j_GetArrayLength;
+              g_jni_table[172] = (void *)j_NewObjectArray; g_jni_table[173] = (void *)j_GetObjectArrayElement; g_jni_table[174] = (void *)j_SetObjectArrayElement;
             g_jni_table[176] = (void *)j_NewByteArray;  g_jni_table[179] = (void *)j_NewIntArray;
             for (i = 183; i <= 190; i++) g_jni_table[i] = (void *)j_ArrElements;     /* Get<T>ArrayElements */
             for (i = 191; i <= 198; i++) g_jni_table[i] = (void *)j_ArrRelease;      /* Release<T>ArrayElements */
@@ -1892,7 +1947,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.2) ==\n");
+            L("== doodleloader (Milestone 3.3) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
