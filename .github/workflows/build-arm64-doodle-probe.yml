@@ -1801,8 +1801,9 @@ jobs:
           }
           /* OFAndroidApp touch callbacks menerima koordinat permukaan/jendela, bukan koordinat logis game.
            * Kursor disimpan dalam koordinat game, jadi ubah balik ke piksel drawable sebelum memanggil JNI. */
-          static float touch_px(float x) { return (float)g_gox + x * g_gs_x; }
-          static float touch_py(float y) { return (float)g_goy + y * g_gs_y; }
+          static int g_up_wait; static float g_up_x, g_up_y;
+          static float touch_px(float x) { return x; }   /* game melihat permukaan 1366x768 -> kirim koordinat game apa adanya */
+          static float touch_py(float y) { return y; }
           static void tap_down(float x, float y) {
             if (nf_touchDown) {
               float px = touch_px(x), py = touch_py(y);
@@ -1828,7 +1829,8 @@ jobs:
               else if (t == 0x653 && p_SDL_GameControllerOpen) p_SDL_GameControllerOpen(*(int32_t *)(ev + 8));   /* CONTROLLERDEVICEADDED */
               else if (t == 0x651 || t == 0x652) {                           /* CONTROLLERBUTTONDOWN / UP */
                 int down = (t == 0x651), b = ev[12];
-                if (b == 0) { if (down) tap_down(g_cx, g_cy); else tap_up(g_cx, g_cy); }
+                L("[input] button %d %s\n", b, down ? "down" : "up");
+                if (b == 0) { if (down) { g_up_wait = 0; tap_down(g_cx, g_cy); } else { g_up_x = g_cx; g_up_y = g_cy; g_up_wait = 3; } }   /* up ditunda >=3 frame agar game sempat melihat 'ditekan' */
                 else if (b == 1 && down && nf_backPressed) { int r = (uint8_t)nf_backPressed(g_nenv, g_ncls); L("[input] backPressed -> %d\n", r); }
                 else if (b == 4) g_btn_back = down;
                 else if (b == 6) g_btn_start = down;
@@ -1846,6 +1848,7 @@ jobs:
               else if (t == 0x701) tap_up(to_gx(*(float *)(ev + 24) * (float)g_ww), to_gy(*(float *)(ev + 28) * (float)g_wh));
               else if (t == 0x702 && g_touch_down && nf_touchMoved) { g_cx = to_gx(*(float *)(ev + 24) * (float)g_ww); g_cy = to_gy(*(float *)(ev + 28) * (float)g_wh); nf_touchMoved(g_nenv, g_ncls, 0, touch_px(g_cx), touch_py(g_cy)); }
             }
+            if (g_up_wait > 0 && --g_up_wait == 0) tap_up(g_up_x, g_up_y);
             dx = g_ax + (float)(g_dp[3] - g_dp[2]); dy = g_ay + (float)(g_dp[1] - g_dp[0]);
             if (dx > 1.f) dx = 1.f;
             if (dx < -1.f) dx = -1.f;
@@ -2140,7 +2143,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.5-splash) ==\n");
+            L("== doodleloader (Milestone 3.6-touch) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
