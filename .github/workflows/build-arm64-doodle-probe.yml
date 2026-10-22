@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3.3 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.4 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -1160,6 +1160,7 @@ jobs:
             if (!strcmp(m->name, "createDirectory")) { host_path(h2s(a[0].l), p, sizeof p); mkdir_p(p); return 1; }
             if (!strcmp(m->name, "deleteFile")) { host_path(h2s(a[0].l), p, sizeof p); unlink(p); return 1; }
             if (!strcmp(m->name, "getResourceBoolean")) return res_bool(h2s(a[0].l), strstr(m->sig, ";Z)Z") ? a[1].i : 0);
+            if (!strcmp(m->name, "isAppInstalled")) return !strcmp(h2s(a[0].l), "com.android.vending");   /* cek Play Store terpasang */
             if (!strcmp(m->name, "isTablet")) return 1;            /* platform = ANDROID_TABLET */
             if (!strcmp(m->name, "isPlayPassVersion")) return 1;   /* bool/play_pass_version = true */
             return 0;
@@ -1947,7 +1948,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.3) ==\n");
+            L("== doodleloader (Milestone 3.4) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
