@@ -768,13 +768,13 @@ jobs:
           static const void *g_vm_table[16];
           static const void *g_envobj = g_jni_table;
           static const void *g_vmobj = g_vm_table;
-          static char *reg_str[4096];
+          static char *reg_str[16384];
           static int reg_n, obj_serial;
 
           static void *mk_handle(const char *s) {
             int i;
             for (i = 0; i < reg_n; i++) if (strcmp(reg_str[i], s) == 0) return (void *)(uintptr_t)(0x70000000u + (uint32_t)i * 4u);
-            if (reg_n >= 4096) return (void *)(uintptr_t)0x70000000u;
+            if (reg_n >= 16384) return (void *)(uintptr_t)0x70000000u;
             reg_str[reg_n] = strdup(s);
             return (void *)(uintptr_t)(0x70000000u + (uint32_t)(reg_n++) * 4u);
           }
@@ -789,6 +789,7 @@ jobs:
           static MInfo minfo[512];
           static int nminfo;
           static int jlog_budget = 600;
+          static int g_dirlog;
           static char g_docpath[512] = "";
 
           static void *mk_method(const char *cls, const char *name, const char *sig, int st) {
@@ -863,6 +864,175 @@ jobs:
             }
           }
 
+          #include <ctype.h>
+          #include <dirent.h>
+
+          /* ---------- array JNI (jbyteArray / jintArray): handle 0x72000000+ ---------- */
+          typedef struct { int used; int esz; int len; unsigned char *data; } JArr;
+          #define MAXARR 1024
+          static JArr g_arr[MAXARR];
+          static void *mk_array(int esz, int len) {
+            int i;
+            for (i = 0; i < MAXARR; i++) if (!g_arr[i].used) {
+              g_arr[i].data = calloc((size_t)(len > 0 ? len : 1), (size_t)esz);
+              if (!g_arr[i].data) return NULL;
+              g_arr[i].used = 1; g_arr[i].esz = esz; g_arr[i].len = len;
+              return (void *)(uintptr_t)(0x72000000u + (uint32_t)i * 4u);
+            }
+            L("[JNI] tabel array penuh\n");
+            return NULL;
+          }
+          static JArr *arr_get(void *h) {
+            uintptr_t v = (uintptr_t)h;
+            if (v >= 0x72000000u && ((v - 0x72000000u) / 4u) < MAXARR && g_arr[(v - 0x72000000u) / 4u].used) return &g_arr[(v - 0x72000000u) / 4u];
+            return NULL;
+          }
+          static void arr_free(void *h) { JArr *a = arr_get(h); if (a) { free(a->data); a->data = NULL; a->used = 0; } }
+
+          /* ---------- nilai balik Java: bisa di-override lewat java_values.txt (baris "namaMetode=nilai") ---------- */
+          typedef struct { char key[64]; char val[256]; } JOv;
+          static JOv g_jov[64];
+          static int g_njov, g_jov_loaded;
+          static void jov_load(void) {
+            FILE *f;
+            char ln[400];
+            if (g_jov_loaded) return;
+            g_jov_loaded = 1;
+            f = fopen("java_values.txt", "r");
+            if (!f) return;
+            while (fgets(ln, sizeof ln, f) && g_njov < 64) {
+              char *e = strchr(ln, '='), *nl;
+              if (ln[0] == '#' || !e) continue;
+              *e++ = 0;
+              nl = strpbrk(e, "\r\n"); if (nl) *nl = 0;
+              snprintf(g_jov[g_njov].key, sizeof g_jov[0].key, "%s", ln);
+              snprintf(g_jov[g_njov].val, sizeof g_jov[0].val, "%s", e);
+              g_njov++;
+            }
+            fclose(f);
+            L("[java] %d nilai override dari java_values.txt\n", g_njov);
+          }
+          static const char *jov_get(const char *k) { int i; jov_load(); for (i = 0; i < g_njov; i++) if (!strcmp(g_jov[i].key, k)) return g_jov[i].val; return NULL; }
+          /* parse manual: JANGAN atoi/strtol (terikat GLIBC_2.38) */
+          static long long jparse(const char *s) { long long v = 0; int neg = 0; if (*s == '-') { neg = 1; s++; } while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return neg ? -v : v; }
+
+          /* DEFAULT TEBAKAN: ganti dengan nilai asli dari GameService (jadx) lewat java_values.txt */
+          static const char *jstr_default(const char *name) {
+            static const struct { const char *k, *v; } d[] = {
+              { "getPackage", "com.joybits.doodleeverything" }, { "getGameID", "doodlegod" }, { "getShortGameID", "dg" },
+              { "getVersionType", "full" }, { "getOriginalVersionType", "full" }, { "getPlatform", "android" },
+              { "getRegion", "US" }, { "getCountry", "US" }, { "getVersion", "1.0" }, { "getSystemLocalizationList", "en" },
+              { "getDeviceDesc", "muOS" }, { "getUDID", "muos-doodlegod-0001" }, { NULL, NULL } };
+            int i;
+            for (i = 0; d[i].k; i++) if (!strcmp(d[i].k, name)) return d[i].v;
+            return "";
+          }
+
+          /* path dari game -> path di disk: absolut dipakai apa adanya, relatif di bawah folder files/ */
+          static void host_path(const char *p, char *out, size_t sz) {
+            if (p[0] == '/') snprintf(out, sz, "%s", p); else snprintf(out, sz, "%s%s", g_docpath, p);
+          }
+          static void mkdir_p(const char *path) {
+            char t[700]; size_t i;
+            snprintf(t, sizeof t, "%s", path);
+            for (i = 1; t[i]; i++) if (t[i] == '/') { t[i] = 0; mkdir(t, 0755); t[i] = '/'; }
+            mkdir(t, 0755);
+          }
+
+          /* listDir/getDirList -> CSV "nama,d" (folder) atau "nama,f" (file); native mem-parse dengan CSVParser(',', '"') dan cek huruf pertama kolom 2 == 'd'.
+           * Sumber: aset di APK (assets/<path>/), kalau kosong baru folder di disk. */
+          static const char *dir_csv(const char *path, char *out, size_t sz) {
+            char pre[600], dirs[256][96], p[700];
+            size_t o = 0, pl;
+            int i, nd = 0, nfound = 0;
+            const char *q = path;
+            while (*q == '/') q++;
+            snprintf(pre, sizeof pre, "assets/%s", q);
+            pl = strlen(pre);
+            while (pl > 7 && pre[pl - 1] == '/') pre[--pl] = 0;
+            if (pl > 6) { pre[pl++] = '/'; pre[pl] = 0; }
+            out[0] = 0;
+            for (i = 0; i < g_nents; i++) {
+              const char *nm = g_ents[i].name, *rest, *sl;
+              char comp[96];
+              size_t cl;
+              int isdir, k, dup = 0;
+              if (strncmp(nm, pre, pl) != 0) continue;
+              rest = nm + pl;
+              if (!*rest) continue;
+              sl = strchr(rest, '/');
+              cl = sl ? (size_t)(sl - rest) : strlen(rest);
+              if (cl == 0 || cl >= sizeof comp) continue;
+              memcpy(comp, rest, cl); comp[cl] = 0;
+              isdir = sl != NULL;
+              if (isdir) {
+                for (k = 0; k < nd; k++) if (!strcmp(dirs[k], comp)) { dup = 1; break; }
+                if (dup) continue;
+                if (nd < 256) snprintf(dirs[nd++], sizeof dirs[0], "%s", comp);
+              }
+              if (o + cl + 8 >= sz) break;
+              o += (size_t)snprintf(out + o, sz - o, "%s,%c\n", comp, isdir ? 'd' : 'f');
+              nfound++;
+            }
+            if (!nfound) {
+              DIR *d;
+              struct dirent *e;
+              host_path(path, p, sizeof p);
+              d = opendir(p);
+              if (d) {
+                while ((e = readdir(d)) != NULL) {
+                  struct stat st; char fp[900];
+                  if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                  snprintf(fp, sizeof fp, "%s/%s", p, e->d_name);
+                  if (o + strlen(e->d_name) + 8 >= sz) break;
+                  o += (size_t)snprintf(out + o, sz - o, "%s,%c\n", e->d_name, (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) ? 'd' : 'f');
+                  nfound++;
+                }
+                closedir(d);
+              }
+            }
+            if (g_dirlog++ < 20) L("[java] listDir(\"%s\") -> %d entri (prefix APK \"%s\")\n", path, nfound, pre);
+            return out;
+          }
+
+          static const char *jstr_value(const MInfo *m, const jv *a) {
+            static char buf[65536];
+            const char *v = jov_get(m->name), *s;
+            size_t i;
+            if (v) return v;
+            if (!strcmp(m->name, "docPath")) return g_docpath;
+            if (!strcmp(m->name, "toUpperUTF8") || !strcmp(m->name, "toLowerUTF8")) {
+              int up = m->name[2] == 'U';
+              s = h2s(a[0].l);
+              for (i = 0; s[i] && i < sizeof buf - 1; i++) buf[i] = (char)(up ? toupper((unsigned char)s[i]) : tolower((unsigned char)s[i]));
+              buf[i] = 0;
+              return buf;
+            }
+            if (!strcmp(m->name, "listDir") || !strcmp(m->name, "getDirList")) return dir_csv(h2s(a[0].l), buf, sizeof buf);
+            return jstr_default(m->name);
+          }
+
+          static int jbool_value(const MInfo *m, const jv *a) {
+            char p[700];
+            if (!strcmp(m->name, "isFileExists")) {
+              struct stat st; const char *q = h2s(a[0].l); char full[700];
+              host_path(q, p, sizeof p);
+              if (stat(p, &st) == 0) return 1;
+              while (*q == '/') q++;
+              snprintf(full, sizeof full, "assets/%s", q);
+              return apk_find(full) != NULL;
+            }
+            if (!strcmp(m->name, "createDirectory")) { host_path(h2s(a[0].l), p, sizeof p); mkdir_p(p); return 1; }
+            if (!strcmp(m->name, "deleteFile")) { host_path(h2s(a[0].l), p, sizeof p); unlink(p); return 1; }
+            return 0;
+          }
+
+          /* loadResource(path, ptr) dari native: diantrekan, dijawab lewat GameService.loadResourceCallback(ptr, byte[], len) oleh pump_resources() */
+          typedef struct { char path[512]; int64_t ptr; } ResReq;
+          static ResReq g_resq[128];
+          static int g_resq_n;
+          static void *g_retarr[512];
+
           /* semua panggilan native -> Java lewat sini: di-log lengkap dengan argumen; nilai balik default (0 / string kosong) */
           static void java_invoke(void *mid, const jv *a, jv *r) {
             MInfo *m = mi_get(mid);
@@ -881,8 +1051,22 @@ jobs:
               size_t k = 0;
               while (*q && *q != ';' && k < sizeof cn - 1) cn[k++] = *q++;
               cn[k] = 0;
-              if (!strcmp(cn, "java/lang/String")) r->l = mk_handle(!strcmp(m->name, "docPath") ? g_docpath : "");
+              if (!strcmp(cn, "java/lang/String")) r->l = mk_handle(jstr_value(m, a));
               else r->l = mk_obj(cn);   /* objek palsu baru (mis. getAssets() -> AssetManager) agar native tidak menerima NULL */
+            } else if (rt == '[' && rp && rp[2] == 'I') {
+              int idx = (int)(m - minfo);   /* int[] (getSafeArea / getBannerSize / getMrecSize): satu array nol per metode */
+              if (idx >= 0 && idx < 512) {
+                if (!g_retarr[idx]) g_retarr[idx] = mk_array(4, !strcmp(m->name, "getSafeArea") ? 4 : 2);
+                r->l = g_retarr[idx];
+              }
+            } else if (rt == 'Z' || rt == 'I' || rt == 'B' || rt == 'C' || rt == 'S' || rt == 'J') {
+              const char *ov = jov_get(m->name);
+              if (ov) { if (rt == 'J') r->j = jparse(ov); else r->i = (int)jparse(ov); }
+              else if (rt == 'Z') r->i = jbool_value(m, a);
+            }
+            if (rt == 'V' && !strcmp(m->name, "loadResource")) {
+              if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
+              else L("[res] antrean penuh, loadResource dibuang\n");
             }
           }
 
@@ -973,6 +1157,30 @@ jobs:
           #define SETFAM(base, N) do { g_jni_table[base] = (void *)j_Call##N##Method; g_jni_table[base + 1] = (void *)j_Call##N##MethodV; g_jni_table[base + 2] = (void *)j_Call##N##MethodA; \
             g_jni_table[base + 80] = (void *)j_CallStatic##N##Method; g_jni_table[base + 81] = (void *)j_CallStatic##N##MethodV; g_jni_table[base + 82] = (void *)j_CallStatic##N##MethodA; } while (0)
 
+          static int j_IsInstanceOf(void *env, void *o, void *cls) {
+            const char *os = h2s(o), *cs = h2s(cls);
+            (void)env;
+            if (!o) return 1;                                   /* spesifikasi JNI: NULL instance dari kelas apa pun */
+            if (!strcmp(cs, "java/lang/Object")) return 1;
+            if (arr_get(o)) return cs[0] == '[';
+            if (!strcmp(cs, "java/lang/String")) return os[0] != '?' && strncmp(os, "obj:", 4) != 0;
+            if (!strncmp(os, "obj:", 4)) { size_t n = strlen(cs); return !strncmp(os + 4, cs, n) && os[4 + n] == '#'; }
+            return 0;
+          }
+          static int j_GetArrayLength(void *env, void *a) { JArr *r = arr_get(a); (void)env; return r ? r->len : 0; }
+          static void *j_NewByteArray(void *env, int n) { (void)env; return mk_array(1, n); }
+          static void *j_NewIntArray(void *env, int n) { (void)env; return mk_array(4, n); }
+          static void *j_ArrElements(void *env, void *a, unsigned char *copy) { JArr *r = arr_get(a); (void)env; if (copy) *copy = 0; return r ? (void *)r->data : NULL; }
+          static void j_ArrRelease(void *env, void *a, void *e, int mode) { (void)env; (void)a; (void)e; (void)mode; }
+          static void j_ArrGetRegion(void *env, void *a, int st, int n, void *buf) {
+            JArr *r = arr_get(a); (void)env;
+            if (r && st >= 0 && n >= 0 && st + n <= r->len) memcpy(buf, r->data + (size_t)st * (size_t)r->esz, (size_t)n * (size_t)r->esz);
+          }
+          static void j_ArrSetRegion(void *env, void *a, int st, int n, const void *buf) {
+            JArr *r = arr_get(a); (void)env;
+            if (r && st >= 0 && n >= 0 && st + n <= r->len) memcpy(r->data + (size_t)st * (size_t)r->esz, buf, (size_t)n * (size_t)r->esz);
+          }
+
           static void init_jni(void) {
             int i;
             for (i = 0; i < 256; i++) g_jni_table[i] = jstubs[i];
@@ -1007,6 +1215,14 @@ jobs:
             g_jni_table[228] = (void *)j_zero1;
             g_vm_table[3] = (void *)vm_Destroy; g_vm_table[4] = (void *)vm_Attach; g_vm_table[5] = (void *)vm_Destroy;
             g_vm_table[6] = (void *)vm_GetEnv;  g_vm_table[7] = (void *)vm_Attach;
+            g_jni_table[32] = (void *)j_IsInstanceOf;
+            g_jni_table[171] = (void *)j_GetArrayLength;
+            g_jni_table[176] = (void *)j_NewByteArray;  g_jni_table[179] = (void *)j_NewIntArray;
+            for (i = 183; i <= 190; i++) g_jni_table[i] = (void *)j_ArrElements;     /* Get<T>ArrayElements */
+            for (i = 191; i <= 198; i++) g_jni_table[i] = (void *)j_ArrRelease;      /* Release<T>ArrayElements */
+            for (i = 199; i <= 206; i++) g_jni_table[i] = (void *)j_ArrGetRegion;
+            for (i = 207; i <= 214; i++) g_jni_table[i] = (void *)j_ArrSetRegion;
+            g_jni_table[222] = (void *)j_ArrElements;  g_jni_table[223] = (void *)j_ArrRelease;   /* Get/ReleasePrimitiveArrayCritical */
           }
 
           /* ======================= pemuat ELF64 ======================= */
@@ -1335,6 +1551,49 @@ jobs:
           }
           static long long now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
 
+          typedef void (*nf_rescb_t)(void *, void *, int64_t, void *, int);
+          /* jawab antrean loadResource seperti Java: baca aset dari APK (atau disk), panggil GameService.loadResourceCallback(ptr, byte[], len) tepat sekali per ptr */
+          static void pump_resources(Mod *dg) {
+            static nf_rescb_t cb;
+            static int looked;
+            int guard = 0;
+            if (!looked) {
+              looked = 1;
+              cb = (nf_rescb_t)mod_find(dg, "Java_com_joybits_doodleeverything_GameService_loadResourceCallback");
+              if (!cb) L("[res] loadResourceCallback TIDAK ADA\n");
+            }
+            while (g_resq_n > 0 && cb && guard++ < 256) {
+              ResReq rq = g_resq[0];
+              unsigned char *buf = NULL;
+              long n = 0;
+              void *arr;
+              const char *q = rq.path;
+              char full[700], hp[700];
+              ZEnt *e;
+              memmove(&g_resq[0], &g_resq[1], sizeof(ResReq) * (size_t)(--g_resq_n));
+              while (*q == '/') q++;
+              snprintf(full, sizeof full, "assets/%s", q);
+              e = apk_find(full);
+              if (e) buf = apk_read(e, &n);
+              if (!buf) {
+                FILE *f; host_path(rq.path, hp, sizeof hp);
+                f = fopen(hp, "rb");
+                if (f) {
+                  long sz; fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+                  if (sz >= 0) { buf = malloc((size_t)sz + 1); if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz) n = sz; else { free(buf); buf = NULL; } }
+                  fclose(f);
+                }
+              }
+              if (buf) { if (g_asset_ok++ < 100) L("[res] %s -> %ld byte\n", rq.path, n); }
+              else { n = 0; if (g_asset_miss++ < 100) L("[res] %s -> TIDAK ADA (APK maupun disk), kirim kosong\n", rq.path); }
+              arr = mk_array(1, (int)n);
+              if (arr && buf && n > 0) memcpy(arr_get(arr)->data, buf, (size_t)n);
+              free(buf);
+              cb(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), rq.ptr, arr, (int)n);
+              arr_free(arr);
+            }
+          }
+
           /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
            * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
           static int run_game(Mod *dg, int frames, int sc) {
@@ -1370,6 +1629,7 @@ jobs:
             for (f = 0; (frames <= 0 || f < frames) && !g_quit; f++) {
               long long n;
               pump_events();
+              pump_resources(dg);
               nf_render(g_nenv, g_ncls);
               p_SDL_GL_SwapWindow(g_win);
               if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai\n", f); gl_check("render"); }
