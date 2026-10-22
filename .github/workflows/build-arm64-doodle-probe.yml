@@ -1,4 +1,4 @@
-name: build-arm64-doodle-m2-dry
+name: build-arm64-doodle-probe
 on:
   workflow_dispatch:
   push:
@@ -6,299 +6,1217 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Install AArch64 toolchain
+      - name: Pasang toolchain ARM 64-bit
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Write M2 ELF dry-run parser and launcher
-        shell: bash
+      - name: Tulis sumber
         run: |
-          set -eu
-          mkdir -p out/doodle_god/libs src
-          cat > src/elfdry64.c <<'EOF_C'
-          /*
-           * M2 Doodle God HD ELF dry-run inspector.
-           * Parses ELF64/AArch64 program headers and PT_DYNAMIC metadata.
-           * It DOES NOT mmap executable segments, relocate memory, call constructors,
-           * call JNI_OnLoad, or execute any game code.
-           */
-          #define _FILE_OFFSET_BITS 64
-          #include <elf.h>
-          #include <errno.h>
-          #include <inttypes.h>
-          #include <stdint.h>
+          mkdir -p src out/doodle_god/libs
+          cat > src/elfprobe64.c <<'EOF_C1'
+          /* elfprobe64 - Milestone 1 port Doodle God HD (arm64-v8a -> Linux aarch64 handheld).
+           * HANYA MEMBACA: mem-parse libdoodle-everything.so + libc++_shared.so (ELF64 AArch64), lalu cek tiap simbol impor
+           * terhadap library milik device (glibc, Mali GLES/EGL, gl4es, SDL2, zlib). Tidak menjalankan kode game.
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38, device cuma 2.37). */
+          #define _GNU_SOURCE
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <elf.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
           #include <sys/stat.h>
-          #include <sys/types.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
 
+          #define MAXN 4096
+          #define NRT 2048
           #ifndef DT_RELR
           #define DT_RELR 36
-          #define DT_RELRSZ 35
-          #define DT_RELRENT 37
           #endif
 
           typedef struct {
-            unsigned char *data;
-            size_t size;
-            Elf64_Ehdr *eh;
-            Elf64_Phdr *ph;
-            size_t phnum;
-          } Image;
+            const uint8_t *map; size_t size;
+            const Elf64_Ehdr *eh; const Elf64_Shdr *sh; const Elf64_Phdr *ph;
+            const Elf64_Sym *sym; int nsym; const char *str;
+            const Elf64_Dyn *dyn; int ndyn;
+            unsigned rt[NRT]; unsigned nrela;
+            unsigned relr_bytes, android_packed, nload, ntls, max_align;
+            uint64_t tls_size;
+          } Lib;
 
-          static int range_ok(uint64_t off, uint64_t len, size_t size) {
-            return off <= (uint64_t)size && len <= (uint64_t)size - off;
+          static FILE *rep;
+
+          static void P(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+            if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); }
           }
 
-          static void *at(Image *im, uint64_t off, uint64_t len) {
-            if (!range_ok(off, len, im->size)) return NULL;
-            return im->data + (size_t)off;
-          }
-
-          static uint64_t vaddr_to_offset(Image *im, uint64_t va, uint64_t len) {
-            size_t i;
-            for (i = 0; i < im->phnum; i++) {
-              Elf64_Phdr *p = &im->ph[i];
-              uint64_t delta;
-              if (p->p_type != PT_LOAD || va < p->p_vaddr) continue;
-              delta = va - p->p_vaddr;
-              if (delta > p->p_filesz || len > p->p_filesz - delta) continue;
-              if (!range_ok(p->p_offset + delta, len, im->size)) continue;
-              return p->p_offset + delta;
-            }
-            return UINT64_MAX;
-          }
-
-          static void *vaddr_ptr(Image *im, uint64_t va, uint64_t len) {
-            uint64_t off = vaddr_to_offset(im, va, len);
-            if (off == UINT64_MAX) return NULL;
-            return at(im, off, len);
-          }
-
-          static int load_image(const char *path, Image *im) {
-            FILE *f;
+          static int load_lib(const char *path, Lib *L) {
             struct stat st;
-            memset(im, 0, sizeof(*im));
-            if (stat(path, &st) || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
-              fprintf(stderr, "ERROR: cannot stat or file too small: %s\n", path);
+            int fd, i;
+            memset(L, 0, sizeof *L);
+            fd = open(path, O_RDONLY);
+            if (fd < 0) { P("GAGAL membuka %s\n", path); return -1; }
+            if (fstat(fd, &st) != 0) { close(fd); return -1; }
+            L->size = (size_t)st.st_size;
+            L->map = mmap(NULL, L->size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (L->map == MAP_FAILED) { P("GAGAL mmap %s\n", path); return -1; }
+            if (L->size < sizeof(Elf64_Ehdr) || memcmp(L->map, ELFMAG, SELFMAG) != 0) { P("%s bukan file ELF\n", path); return -1; }
+            L->eh = (const Elf64_Ehdr *)L->map;
+            if (L->eh->e_ident[EI_CLASS] != ELFCLASS64 || L->eh->e_machine != EM_AARCH64) {
+              P("%s bukan ELF AArch64 64-bit (class=%d machine=%d)\n", path, L->eh->e_ident[EI_CLASS], L->eh->e_machine);
               return -1;
             }
-            im->size = (size_t)st.st_size;
-            im->data = malloc(im->size);
-            if (!im->data) { perror("malloc"); return -1; }
-            f = fopen(path, "rb");
-            if (!f) { perror(path); free(im->data); im->data = NULL; return -1; }
-            if (fread(im->data, 1, im->size, f) != im->size) {
-              fprintf(stderr, "ERROR: short read: %s\n", path);
-              fclose(f); free(im->data); im->data = NULL; return -1;
+            if ((size_t)L->eh->e_phoff + (size_t)L->eh->e_phnum * sizeof(Elf64_Phdr) <= L->size) {
+              L->ph = (const Elf64_Phdr *)(L->map + L->eh->e_phoff);
+              for (i = 0; i < L->eh->e_phnum; i++) {
+                if (L->ph[i].p_type == PT_LOAD) { L->nload++; if (L->ph[i].p_align > L->max_align) L->max_align = (unsigned)L->ph[i].p_align; }
+                else if (L->ph[i].p_type == PT_TLS) { L->ntls++; L->tls_size = L->ph[i].p_memsz; }
+              }
             }
-            fclose(f);
-            im->eh = (Elf64_Ehdr *)im->data;
-            if (memcmp(im->eh->e_ident, ELFMAG, SELFMAG) ||
-                im->eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-                im->eh->e_ident[EI_DATA] != ELFDATA2LSB ||
-                im->eh->e_machine != EM_AARCH64 ||
-                (im->eh->e_type != ET_DYN && im->eh->e_type != ET_EXEC)) {
-              fprintf(stderr, "ERROR: expected little-endian ELF64 AArch64 ET_DYN/ET_EXEC: %s\n", path);
-              free(im->data); im->data = NULL; return -1;
+            if (L->eh->e_shoff == 0 || L->eh->e_shentsize != sizeof(Elf64_Shdr) ||
+                (size_t)L->eh->e_shoff + (size_t)L->eh->e_shnum * sizeof(Elf64_Shdr) > L->size) {
+              P("%s: section header tidak ada/rusak\n", path); return -1;
             }
-            if (im->eh->e_phentsize != sizeof(Elf64_Phdr) ||
-                !range_ok(im->eh->e_phoff, (uint64_t)im->eh->e_phnum * sizeof(Elf64_Phdr), im->size)) {
-              fprintf(stderr, "ERROR: invalid program-header table\n");
-              free(im->data); im->data = NULL; return -1;
+            L->sh = (const Elf64_Shdr *)(L->map + L->eh->e_shoff);
+            for (i = 0; i < L->eh->e_shnum; i++) {
+              const Elf64_Shdr *s = &L->sh[i];
+              if ((size_t)s->sh_offset + s->sh_size > L->size) continue;
+              if (s->sh_type == SHT_DYNSYM) {
+                L->sym = (const Elf64_Sym *)(L->map + s->sh_offset);
+                L->nsym = (int)(s->sh_size / sizeof(Elf64_Sym));
+                if (s->sh_link < L->eh->e_shnum) L->str = (const char *)(L->map + L->sh[s->sh_link].sh_offset);
+              } else if (s->sh_type == SHT_DYNAMIC) {
+                L->dyn = (const Elf64_Dyn *)(L->map + s->sh_offset);
+                L->ndyn = (int)(s->sh_size / sizeof(Elf64_Dyn));
+              } else if (s->sh_type == SHT_RELA) {
+                const Elf64_Rela *r = (const Elf64_Rela *)(L->map + s->sh_offset);
+                size_t k, n = s->sh_size / sizeof(Elf64_Rela);
+                for (k = 0; k < n; k++) { unsigned t = (unsigned)ELF64_R_TYPE(r[k].r_info); L->rt[t < NRT ? t : NRT - 1]++; L->nrela++; }
+              } else if (s->sh_type == 19 /* SHT_RELR */) {
+                L->relr_bytes += (unsigned)s->sh_size;
+              } else if (s->sh_type == 0x60000001u || s->sh_type == 0x60000002u /* SHT_ANDROID_REL/RELA */) {
+                L->android_packed += (unsigned)s->sh_size;
+              }
             }
-            im->ph = (Elf64_Phdr *)(im->data + im->eh->e_phoff);
-            im->phnum = im->eh->e_phnum;
+            if (!L->sym || !L->str) { P("%s: .dynsym tidak ditemukan\n", path); return -1; }
             return 0;
           }
 
-          static const char *relname(unsigned t) {
+          static const char *rtname(unsigned t) {
             switch (t) {
-              case R_AARCH64_NONE: return "NONE";
-              case R_AARCH64_ABS64: return "ABS64";
-              case R_AARCH64_ABS32: return "ABS32";
-              case R_AARCH64_PREL64: return "PREL64";
-              case R_AARCH64_GLOB_DAT: return "GLOB_DAT";
-              case R_AARCH64_JUMP_SLOT: return "JUMP_SLOT";
-              case R_AARCH64_RELATIVE: return "RELATIVE";
-              case R_AARCH64_TLS_DTPMOD: return "TLS_DTPMOD";
-              case R_AARCH64_TLS_DTPREL: return "TLS_DTPREL";
-              case R_AARCH64_TLS_TPREL: return "TLS_TPREL";
-              case R_AARCH64_TLSDESC: return "TLSDESC";
-              case R_AARCH64_IRELATIVE: return "IRELATIVE";
-              default: return "OTHER";
+              case 257: return "R_AARCH64_ABS64";
+              case 1024: return "R_AARCH64_COPY";
+              case 1025: return "R_AARCH64_GLOB_DAT";
+              case 1026: return "R_AARCH64_JUMP_SLOT";
+              case 1027: return "R_AARCH64_RELATIVE";
+              case 1028: return "R_AARCH64_TLS_DTPMOD";
+              case 1029: return "R_AARCH64_TLS_DTPREL";
+              case 1030: return "R_AARCH64_TLS_TPREL";
+              case 1031: return "R_AARCH64_TLSDESC";
+              case 1032: return "R_AARCH64_IRELATIVE";
+              default: return NULL;
             }
           }
 
-          typedef struct {
-            uint64_t rela, relasz, relaent;
-            uint64_t rel, relsz, relent;
-            uint64_t jmprel, pltrelsz, pltrel;
-            uint64_t symtab, syment, strtab, strsz;
-            uint64_t relr, relrsz, relrent;
-            uint64_t android_rela, android_relasz, android_rel, android_relsz;
-            uint64_t needed[128]; size_t nneeded;
-            uint64_t soname;
-            uint64_t init, init_array, init_arraysz;
-            uint64_t pltgot, flags, flags1;
-          } DynInfo;
+          static void print_header(const Lib *L) {
+            int i;
+            unsigned shown = 0;
+            for (i = 0; i < L->ndyn; i++) {
+              if (L->dyn[i].d_tag == DT_NEEDED) P("  NEEDED %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (L->dyn[i].d_tag == DT_SONAME) P("  SONAME %s\n", L->str + L->dyn[i].d_un.d_val);
+              else if (L->dyn[i].d_tag == DT_RELR || L->dyn[i].d_tag == DT_TEXTREL) P("  PERINGATAN: dynamic tag %ld (RELR/TEXTREL) ada -> loader harus mendukungnya\n", (long)L->dyn[i].d_tag);
+              else if (L->dyn[i].d_tag == 0x6000000f || L->dyn[i].d_tag == 0x60000011) P("  PERINGATAN: packed relocation Android (APS2) -> loader harus decode sendiri\n");
+            }
+            P("  PT_LOAD=%u (align maks 0x%x) | PT_TLS=%u (ukuran %llu)\n", L->nload, L->max_align, L->ntls, (unsigned long long)L->tls_size);
+            P("  relokasi RELA total=%u | RELR bytes=%u | packed Android bytes=%u\n", L->nrela, L->relr_bytes, L->android_packed);
+            for (i = 0; i < NRT; i++) if (L->rt[i]) {
+              const char *n = rtname((unsigned)i);
+              if (n) P("    %-22s %u\n", n, L->rt[i]); else P("    tipe %-17d %u\n", i, L->rt[i]);
+              shown++;
+            }
+            (void)shown;
+          }
 
-          static void read_dynamic(Image *im, DynInfo *d) {
-            size_t i;
-            memset(d, 0, sizeof(*d));
-            for (i = 0; i < im->phnum; i++) {
-              Elf64_Phdr *p = &im->ph[i];
-              if (p->p_type == PT_DYNAMIC) {
-                Elf64_Dyn *dyn = (Elf64_Dyn *)at(im, p->p_offset, p->p_filesz);
-                size_t n = (size_t)(p->p_filesz / sizeof(Elf64_Dyn)), j;
-                if (!dyn) { puts("ERROR: PT_DYNAMIC points outside file"); return; }
-                for (j = 0; j < n && dyn[j].d_tag != DT_NULL; j++) {
-                  uint64_t v = dyn[j].d_un.d_val;
-                  switch (dyn[j].d_tag) {
-                    case DT_NEEDED: if (d->nneeded < 128) d->needed[d->nneeded++] = v; break;
-                    case DT_SONAME: d->soname = v; break;
-                    case DT_RELA: d->rela = v; break;
-                    case DT_RELASZ: d->relasz = v; break;
-                    case DT_RELAENT: d->relaent = v; break;
-                    case DT_REL: d->rel = v; break;
-                    case DT_RELSZ: d->relsz = v; break;
-                    case DT_RELENT: d->relent = v; break;
-                    case DT_JMPREL: d->jmprel = v; break;
-                    case DT_PLTRELSZ: d->pltrelsz = v; break;
-                    case DT_PLTREL: d->pltrel = v; break;
-                    case DT_SYMTAB: d->symtab = v; break;
-                    case DT_SYMENT: d->syment = v; break;
-                    case DT_STRTAB: d->strtab = v; break;
-                    case DT_STRSZ: d->strsz = v; break;
-                    case DT_RELR: d->relr = v; break;
-                    case DT_RELRSZ: d->relrsz = v; break;
-                    case DT_RELRENT: d->relrent = v; break;
-                    case DT_INIT: d->init = v; break;
-                    case DT_INIT_ARRAY: d->init_array = v; break;
-                    case DT_INIT_ARRAYSZ: d->init_arraysz = v; break;
-                    case DT_PLTGOT: d->pltgot = v; break;
-                    case DT_FLAGS: d->flags = v; break;
-                    case DT_FLAGS_1: d->flags1 = v; break;
-                    default:
-                      /* Android packed relocation tags commonly used by bionic. */
-                      if ((uint64_t)dyn[j].d_tag == 0x6000000f) d->android_rela = v;
-                      if ((uint64_t)dyn[j].d_tag == 0x60000010) d->android_relasz = v;
-                      if ((uint64_t)dyn[j].d_tag == 0x60000011) d->android_rel = v;
-                      if ((uint64_t)dyn[j].d_tag == 0x60000012) d->android_relsz = v;
-                      break;
+          static int has_export(const Lib *L, const char *name) {
+            int i;
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && strcmp(L->str + s->st_name, name) == 0) return 1;
+            }
+            return 0;
+          }
+
+          static int starts(const char *n, const char *p) { return strncmp(n, p, strlen(p)) == 0; }
+
+          /* simbol yang ada di glibc tapi layout/ABI/semantik-nya BEDA dari bionic (Android) -> perlu pembungkus atau dicek */
+          static int abi_risky(const char *n) {
+            static const char *pfx[] = { "pthread_", "sem_", "stat", "fstat", "lstat", "readdir", "scandir", "opendir", "closedir",
+              "setjmp", "longjmp", "_setjmp", "_longjmp", "sigsetjmp", "siglongjmp", "sigaction", "signal", "dl", "strerror_r",
+              "__register_atfork", "dl_iterate_phdr", "_Unwind_", "__gxx_personality", "stdin", "stdout", "stderr", "syscall",
+              "getrusage", "basename", "timezone", "tzset", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          /* API Android murni (libandroid/liblog/libc bionic-only): tidak akan pernah ada di glibc, harus dishim */
+          static int android_api(const char *n) {
+            static const char *pfx[] = { "AAsset", "AAssetManager", "ALooper", "ANativeWindow", "AInput", "ASensor", "AConfiguration",
+              "AAudio", "ANativeActivity", "AndroidBitmap", "AAssetDir", "android_", "__android", "__system_property", NULL };
+            int i;
+            for (i = 0; pfx[i]; i++) if (starts(n, pfx[i])) return 1;
+            return 0;
+          }
+
+          static void *try_open_any(const char *label, const char **paths) {
+            int i;
+            void *h = NULL;
+            for (i = 0; paths[i]; i++) {
+              h = dlopen(paths[i], RTLD_LAZY | RTLD_LOCAL);
+              if (h) { P("  %-12s OK    : %s\n", label, paths[i]); return h; }
+            }
+            P("  %-12s TIDAK : dicoba", label);
+            for (i = 0; paths[i]; i++) P(" %s", paths[i]);
+            P("\n");
+            return NULL;
+          }
+
+          typedef struct { const char *name[MAXN]; int n; } List;
+          static void add(List *l, const char *s) { if (l->n < MAXN) l->name[l->n++] = s; }
+          static void dump(const char *title, const List *l) {
+            int i;
+            P("\n-- %s (%d)\n", title, l->n);
+            for (i = 0; i < l->n; i++) P("  %s\n", l->name[i]);
+          }
+
+          static void classify(const Lib *L, const Lib *cpp, const char *label, void *h_gles, void *h_mali, void *h_gl4es, void *h_egl) {
+            static List cp, ok, risky, gl, droid, miss;
+            int i, nimp = 0;
+            memset(&cp, 0, sizeof cp); memset(&ok, 0, sizeof ok); memset(&risky, 0, sizeof risky);
+            memset(&gl, 0, sizeof gl); memset(&droid, 0, sizeof droid); memset(&miss, 0, sizeof miss);
+            P("\n=== %s: klasifikasi simbol impor ===\n", label);
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              nimp++;
+              if (cpp && has_export(cpp, n)) { add(&cp, n); continue; }
+              if (android_api(n)) { add(&droid, n); continue; }
+              if (dlsym(RTLD_DEFAULT, n)) { if (abi_risky(n)) add(&risky, n); else add(&ok, n); continue; }
+              if ((h_gles && dlsym(h_gles, n)) || (h_mali && dlsym(h_mali, n)) || (h_gl4es && dlsym(h_gl4es, n)) || (h_egl && dlsym(h_egl, n))) { add(&gl, n); continue; }
+              add(&miss, n);
+            }
+            P("total impor=%d | dari libc++_shared=%d | API Android (wajib shim)=%d | glibc aman=%d | glibc tapi ABI/semantik beda=%d | GL/EGL device=%d | TIDAK ADA=%d\n",
+              nimp, cp.n, droid.n, ok.n, risky.n, gl.n, miss.n);
+            dump("API Android: wajib diimplementasi sendiri (shim)", &droid);
+            dump("ABI-RISK: ada di glibc tapi perlu dicek/pembungkus", &risky);
+            dump("TIDAK ADA di mana pun: perlu shim/implementasi sendiri", &miss);
+          }
+
+          static void gl_report(const Lib *L, void *h_gles, void *h_mali, void *h_gl4es) {
+            int i, total = 0, okm = 0, onlyg = 0;
+            P("\n=== fungsi GL/EGL yang dipakai libdoodle-everything.so ===\n");
+            P("  huruf: C=libGLESv1_CM  M=libmali  G=gl4es  (-=tidak ada)\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *n;
+              int c, m, g;
+              if (s->st_shndx != SHN_UNDEF || !s->st_name) continue;
+              n = L->str + s->st_name;
+              if (strncmp(n, "gl", 2) != 0 && strncmp(n, "egl", 3) != 0) continue;
+              c = h_gles && dlsym(h_gles, n) != NULL; m = h_mali && dlsym(h_mali, n) != NULL; g = h_gl4es && dlsym(h_gl4es, n) != NULL;
+              total++; if (c || m) okm++; else if (g) onlyg++;
+              P("  %c%c%c %s\n", c ? 'C' : '-', m ? 'M' : '-', g ? 'G' : '-', n);
+            }
+            P("ringkas: %d fungsi GL/EGL dipakai, %d tersedia langsung di GLESv1_CM/libmali, %d hanya di gl4es\n", total, okm, onlyg);
+          }
+
+          static void jni_report(const Lib *L) {
+            int i, n = 0, onload = 0;
+            P("\n=== titik masuk JNI terekspor oleh libdoodle-everything.so ===\n");
+            for (i = 1; i < L->nsym; i++) {
+              const Elf64_Sym *s = &L->sym[i];
+              const char *nm;
+              if (s->st_shndx == SHN_UNDEF || !s->st_name) continue;
+              nm = L->str + s->st_name;
+              if (strcmp(nm, "JNI_OnLoad") == 0) { onload = 1; P("  JNI_OnLoad\n"); }
+              else if (starts(nm, "Java_")) { n++; P("  %s\n", nm + 5); }
+            }
+            P("total Java_*: %d | JNI_OnLoad: %s\n", n, onload ? "ada" : "TIDAK ADA");
+          }
+
+          /* tanda tangan JNI valid: "(" ... ")" diikuti satu tipe (V Z B C S I J F D L[ ) */
+          static int jni_sig(const char *s) {
+            const char *p;
+            if (s[0] != '(') return 0;
+            p = strchr(s, ')');
+            if (!p || !p[1]) return 0;
+            p++;
+            while (*p == '[') p++;
+            if (*p == 'L') return strchr(p, ';') != NULL;
+            return strchr("VZBCSIJFD", *p) != NULL && p[1] == 0;
+          }
+
+          /* string di binary yang menunjukkan apa yang native panggil di sisi Java: tanda tangan metode + nama kelas */
+          static void string_scan(const Lib *L) {
+            static const char *seen[600];
+            int nseen = 0, hits = 0;
+            size_t i, st = 0;
+            P("\n=== string JNI di libdoodle-everything.so (petunjuk panggilan native -> Java) ===\n");
+            for (i = 0; i <= L->size; i++) {
+              unsigned char c = i < L->size ? L->map[i] : 0;
+              if (c >= 32 && c < 127) continue;
+              if (c == 0 && i - st >= 3 && i - st <= 200) {
+                const char *s = (const char *)(L->map + st);
+                int want = jni_sig(s) || strstr(s, "com/joybits") || starts(s, "java/") || starts(s, "android/") || starts(s, "org/") ||
+                           starts(s, "com/google") || starts(s, "javax/");
+                if (want) {
+                  int k, dup = 0;
+                  for (k = 0; k < nseen; k++) if (strcmp(seen[k], s) == 0) { dup = 1; break; }
+                  if (!dup && nseen < 600) { seen[nseen++] = s; hits++; P("  %s\n", s); }
+                }
+              }
+              st = i + 1;
+            }
+            P("total string JNI unik: %d\n", hits);
+          }
+
+          static void env_report(void) {
+            static const char *sdl_paths[] = { "libSDL2-2.0.so.0", "/usr/lib/libSDL2-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0",
+              "/usr/lib64/libSDL2-2.0.so.0", "/lib/libSDL2-2.0.so.0", NULL };
+            static const char *z_paths[] = { "libz.so.1", "/usr/lib/libz.so.1", "/usr/lib/aarch64-linux-gnu/libz.so.1", "/lib/libz.so.1", NULL };
+            static const char *mix_paths[] = { "libSDL2_mixer-2.0.so.0", "/usr/lib/libSDL2_mixer-2.0.so.0", "/usr/lib/aarch64-linux-gnu/libSDL2_mixer-2.0.so.0", NULL };
+            static const char *sdl_need[] = { "SDL_Init", "SDL_CreateWindow", "SDL_GL_CreateContext", "SDL_GL_SetAttribute", "SDL_GL_SwapWindow",
+              "SDL_PollEvent", "SDL_OpenAudioDevice", "SDL_PauseAudioDevice", "SDL_GameControllerOpen", "SDL_JoystickOpen", "SDL_GetVersion", NULL };
+            static const char *z_need[] = { "inflate", "inflateInit2_", "inflateEnd", "zlibVersion", NULL };
+            void *h; int i;
+            P("\n== SDL2 / zlib / mixer 64-bit di device ==\n");
+            h = try_open_any("SDL2", sdl_paths);
+            if (h) {
+              unsigned char ver[3] = {0, 0, 0};
+              void (*gv)(void *) = NULL;
+              *(void **)&gv = dlsym(h, "SDL_GetVersion");
+              if (gv) { gv(ver); P("  SDL versi: %u.%u.%u\n", ver[0], ver[1], ver[2]); }
+              for (i = 0; sdl_need[i]; i++) P("  %-26s %s\n", sdl_need[i], dlsym(h, sdl_need[i]) ? "ada" : "TIDAK");
+            }
+            h = try_open_any("zlib", z_paths);
+            if (h) for (i = 0; z_need[i]; i++) P("  %-26s %s\n", z_need[i], dlsym(h, z_need[i]) ? "ada" : "TIDAK");
+            h = try_open_any("SDL2_mixer", mix_paths);
+            (void)h;
+          }
+
+          int main(int argc, char **argv) {
+            Lib dg, cpp;
+            struct utsname u;
+            void *h_gles, *h_mali, *h_gl4es, *h_egl;
+            int have_cpp = 0;
+            static const char *gles_p[] = { "libGLESv1_CM.so.1", "/usr/lib/libGLESv1_CM.so.1", "/usr/lib/aarch64-linux-gnu/libGLESv1_CM.so.1", "/usr/lib64/libGLESv1_CM.so.1", NULL };
+            static const char *mali_p[] = { "/usr/lib/libmali.so", "/usr/lib/libmali.so.1", "/usr/lib/aarch64-linux-gnu/libmali.so", "/usr/lib64/libmali.so", "libmali.so", NULL };
+            static const char *egl_p[] = { "libEGL.so.1", "/usr/lib/libEGL.so.1", "/usr/lib/aarch64-linux-gnu/libEGL.so.1", "/usr/lib64/libEGL.so.1", NULL };
+            static const char *gl4es_p[] = { "/usr/lib/gl4es/libGL.so.1", "/usr/lib/aarch64-linux-gnu/gl4es/libGL.so.1", "/usr/lib64/gl4es/libGL.so.1", NULL };
+
+            if (argc < 2) { fprintf(stderr, "pakai: %s libdoodle-everything.so [libc++_shared.so] [report.txt]\n", argv[0]); return 2; }
+            if (argc > 3) rep = fopen(argv[3], "w");
+
+            P("== elfprobe64 (Doodle God HD, Milestone 1) ==\n");
+            if (uname(&u) == 0) P("device: %s %s %s\n", u.sysname, u.release, u.machine);
+            P("glibc: %s | page size: %ld\n", gnu_get_libc_version(), (long)sysconf(_SC_PAGESIZE));
+
+            /* muat runtime umum supaya dlsym(RTLD_DEFAULT) mewakili apa yang tersedia untuk game */
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+            dlopen("libstdc++.so.6", RTLD_NOW | RTLD_GLOBAL);
+
+            P("\n== library grafik 64-bit di device ==\n");
+            h_gles = try_open_any("GLESv1_CM", gles_p);
+            h_mali = try_open_any("libmali", mali_p);
+            h_egl = try_open_any("EGL", egl_p);
+            h_gl4es = try_open_any("gl4es", gl4es_p);
+            if (h_egl) P("  eglGetProcAddress: %s | eglGetDisplay: %s\n", dlsym(h_egl, "eglGetProcAddress") ? "ada" : "TIDAK", dlsym(h_egl, "eglGetDisplay") ? "ada" : "TIDAK");
+
+            env_report();
+
+            P("\n== libdoodle-everything.so ==\n");
+            if (load_lib(argv[1], &dg) != 0) return 1;
+            P("  ukuran file: %zu byte\n", dg.size);
+            print_header(&dg);
+
+            if (argc > 2 && argv[2][0] && load_lib(argv[2], &cpp) == 0) {
+              have_cpp = 1;
+              P("\n== libc++_shared.so ==\n");
+              P("  ukuran file: %zu byte | simbol terekspor: %d\n", cpp.size, cpp.nsym - 1);
+              print_header(&cpp);
+            } else if (argc > 2) P("\n(libc++_shared.so tidak bisa dibaca; klasifikasi C++ dilewati)\n");
+
+            classify(&dg, have_cpp ? &cpp : NULL, "libdoodle-everything.so", h_gles, h_mali, h_gl4es, h_egl);
+            if (have_cpp) classify(&cpp, NULL, "libc++_shared.so", h_gles, h_mali, h_gl4es, h_egl);
+            gl_report(&dg, h_gles, h_mali, h_gl4es);
+            jni_report(&dg);
+            string_scan(&dg);
+
+            P("\n== selesai ==\n");
+            if (rep) fclose(rep);
+            return 0;
+          }
+          EOF_C1
+          cat > src/doodleloader.c <<'EOF_C2'
+          /* doodleloader - Milestone 2 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+           * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
+           * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
+           * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--selftest]
+           *   stage 0 = muat + relokasi + laporan resolusi simbol (TIDAK ada kode game yang dijalankan)
+           *   stage 1 = + jalankan konstruktor (init_array) libc++_shared lalu libdoodle-everything
+           *   stage 2 = + JNI_OnLoad libdoodle-everything dengan JNI palsu (semua panggilan Java di-log)
+           * Catatan glibc: JANGAN pakai strtol/sscanf/atoi dkk (dengan _GNU_SOURCE terikat ke GLIBC_2.38). */
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdarg.h>
+          #include <setjmp.h>
+          #include <errno.h>
+          #include <elf.h>
+          #include <link.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <pthread.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/utsname.h>
+          #include <gnu/libc-version.h>
+
+          #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+          #define PAGE 4096u
+          #define MAXMOD 4
+          #define MAXUNRES 64
+
+          static FILE *g_log;
+
+          static void L(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt); vfprintf(stdout, fmt, ap); va_end(ap); fflush(stdout);
+            if (g_log) { va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap); fflush(g_log); }
+          }
+
+          /* ======================= modul ELF ======================= */
+          typedef struct {
+            char name[64];
+            uint8_t *file; size_t fsize;
+            uint8_t *base; size_t span; uintptr_t bias;
+            Elf64_Sym *sym; int nsym; const char *str;
+            Elf64_Rela *rela; uint32_t nrela; Elf64_Rela *jrela; uint32_t njrela;
+            uint64_t init; uint64_t *iarr; uint32_t niarr;
+            uint64_t *rval; uint8_t *rhave;      /* cache resolusi simbol per indeks dynsym */
+          } Mod;
+
+          static Mod mods[MAXMOD];
+          static int nmods;
+
+          static const char *unres_name[MAXUNRES];
+          static int nunres;
+          static int cnt_self, cnt_mod, cnt_shim, cnt_libc, cnt_gl, cnt_unres, cnt_weak0;
+          static void *h_gles, *h_egl;
+
+          static int trap_unres(int i);
+          static int jni_trap(int i);
+          #include "stubs.inc"
+
+          static int trap_unres(int i) {
+            L("\n*** PANGGILAN KE SIMBOL TAK TERSELESAIKAN: %s ***\n", (i >= 0 && i < nunres) ? unres_name[i] : "?");
+            _exit(3);
+            return 0;
+          }
+
+          /* ======================= kanari stack TLS =======================
+           * Kode Android arm64 membaca kanari stack dari [tpidr_el0 + 40] (TLS slot 5 bionic). Di glibc slot itu berisi data lain
+           * yang bisa berubah -> "stack smashing" palsu. Solusi: blok TLS executable ini (modul TLS pertama, mulai tp+16)
+           * diisi konstanta yang sama di semua kata, dan gambar awal .tdata disalin ke SETIAP thread baru. */
+          #define C8 0x5ad0c0de1badc0deULL
+          static __thread uint64_t g_tls_guard[16] __attribute__((aligned(16), used)) = { C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8, C8 };
+
+          static int tls_guard_check(void) {
+          #if defined(__aarch64__)
+            uint64_t tp, v;
+            __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+            v = *(volatile uint64_t *)(tp + 40);
+            L("[tls] kanari di tp+40 = 0x%llx (harus 0x%llx) | blok TLS kita mulai di tp+%lld -> %s\n", (unsigned long long)v, (unsigned long long)C8,
+              (long long)((uintptr_t)&g_tls_guard[0] - (uintptr_t)tp), v == C8 ? "OK" : "TIDAK COCOK");
+            return v == C8 ? 0 : -1;
+          #else
+            (void)g_tls_guard;
+            L("[tls] (bukan aarch64: pengecekan kanari dilewati)\n");
+            return 0;
+          #endif
+          }
+
+          /* ======================= diagnostik crash ======================= */
+          static const char *game_sym(const Mod *m, uintptr_t a, uint64_t *delta) {
+            uint64_t off = (uint64_t)(a - m->bias), best = 0; const char *nm = NULL; int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf64_Sym *y = &m->sym[i];
+              if (y->st_shndx == SHN_UNDEF || !y->st_name || ELF64_ST_TYPE(y->st_info) != STT_FUNC) continue;
+              if (y->st_value <= off && y->st_value >= best) { best = y->st_value; nm = m->str + y->st_name; }
+            }
+            *delta = off - best;
+            return nm;
+          }
+          static void describe(uintptr_t a) {
+            int i;
+            for (i = 0; i < nmods; i++)
+              if (a >= (uintptr_t)mods[i].base && a < (uintptr_t)mods[i].base + mods[i].span) {
+                uint64_t d = 0; const char *nm = game_sym(&mods[i], a, &d);
+                L("    -> %s + 0x%llx  [%s+0x%llx]\n", mods[i].name, (unsigned long long)(a - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
+              }
+          }
+          static void map_of(const char *tag, uintptr_t a) {
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            if (!m) return;
+            while (fgets(ln, sizeof ln, m)) {
+              unsigned long lo = 0, hi = 0;
+              const char *q = ln;
+              /* parse hex manual: sscanf/strtoul di glibc build >=2.38 terikat ke simbol GLIBC_2.38 */
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) lo = lo * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (*q == '-') q++;
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) hi = hi * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (hi && a >= lo && a < hi) {
+                char *nl = strchr(ln, '\n'); if (nl) *nl = 0;
+                L("    %s in map: %s\n", tag, ln);
+                break;
+              }
+            }
+            fclose(m);
+          }
+          static void on_sig(int sig, siginfo_t *si, void *ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            uintptr_t pc = 0, lr = 0, sp = 0;
+            (void)uc; (void)sp; (void)lr;
+          #if defined(__aarch64__)
+            pc = (uintptr_t)uc->uc_mcontext.pc; lr = (uintptr_t)uc->uc_mcontext.regs[30]; sp = (uintptr_t)uc->uc_mcontext.sp;
+          #endif
+            L("\n*** SINYAL %d  addr=%p  pc=%p  lr=%p ***\n", sig, si->si_addr, (void *)pc, (void *)lr);
+            describe(pc); describe(lr);
+            map_of("pc", pc); map_of("lr", lr);
+          #if defined(__aarch64__)
+            {
+              int k;
+              for (k = 0; k < 30; k += 4)
+                L("    x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n", k, (unsigned long long)uc->uc_mcontext.regs[k], k + 1, (unsigned long long)uc->uc_mcontext.regs[k + 1],
+                  k + 2, (unsigned long long)uc->uc_mcontext.regs[k + 2], k + 3 < 30 ? k + 3 : 29, (unsigned long long)uc->uc_mcontext.regs[k + 3 < 30 ? k + 3 : 29]);
+              L("    sp=%016llx\n", (unsigned long long)sp);
+              if (pc > 64) {  /* kata instruksi di sekitar pc untuk disassembly offline */
+                const uint32_t *c = (const uint32_t *)((pc & ~(uintptr_t)3) - 48);
+                L("  [code] 12 kata sebelum pc + pc + 3 sesudah (mulai %p):", (const void *)c);
+                for (k = 0; k < 16; k++) { if (k % 4 == 0) L("\n   "); L(" %08x", c[k]); }
+                L("\n");
+              }
+              {
+                const uintptr_t *s = (const uintptr_t *)sp; int shown = 0;
+                L("  [stack] kandidat return address di modul game:\n");
+                for (k = 0; k < 256 && shown < 24; k++) {
+                  int i;
+                  for (i = 0; i < nmods; i++)
+                    if (s[k] >= (uintptr_t)mods[i].base && s[k] < (uintptr_t)mods[i].base + mods[i].span) {
+                      uint64_t d = 0; const char *nm = game_sym(&mods[i], s[k], &d);
+                      L("    sp+%d: %s + 0x%llx  [%s+0x%llx]\n", k * 8, mods[i].name, (unsigned long long)(s[k] - mods[i].bias), nm ? nm : "?", (unsigned long long)d);
+                      shown++; break;
+                    }
+                }
+              }
+            }
+          #endif
+            _exit(128 + sig);
+          }
+          static void on_alarm(int sig) { (void)sig; L("\n*** WATCHDOG: waktu habis, proses dihentikan ***\n"); _exit(4); }
+
+          /* ======================= shim bionic -> glibc ======================= */
+          /* bionic LP64: sizeof(FILE)=152; __sF = array 3 FILE (stdin, stdout, stderr). Kode lama memakai &__sF[n] -> petakan ke stdio glibc. */
+          #define BSF 152
+          static char bionic_sF[3 * BSF];
+          static FILE *xf(FILE *f) {
+            uintptr_t a = (uintptr_t)f, b = (uintptr_t)bionic_sF;
+            if (a >= b && a < b + sizeof bionic_sF) { unsigned i = (unsigned)((a - b) / BSF); return i == 0 ? stdin : i == 1 ? stdout : stderr; }
+            return f;
+          }
+          static int b_fprintf(FILE *f, const char *fmt, ...) { va_list ap; int r; va_start(ap, fmt); r = vfprintf(xf(f), fmt, ap); va_end(ap); return r; }
+          static int b_fputs(const char *s, FILE *f) { return fputs(s, xf(f)); }
+          static int b_fputc(int c, FILE *f) { return fputc(c, xf(f)); }
+          static size_t b_fwrite(const void *p, size_t s, size_t n, FILE *f) { return fwrite(p, s, n, xf(f)); }
+          static int b_fflush(FILE *f) { return fflush(xf(f)); }
+
+          /* fortify bionic. CATATAN: __fread_chk glibc urutan argumennya BEDA (ptr,ptrlen,size,n,stream) -> wajib shim. */
+          static size_t b_strlen_chk(const char *s, size_t n) { size_t l = strlen(s); if (l >= n) { L("*** __strlen_chk: overflow\n"); abort(); } return l; }
+          static char *b_strncpy_chk2(char *d, const char *s, size_t n, size_t dl, size_t sl) { (void)sl; if (n > dl) { L("*** __strncpy_chk2: overflow\n"); abort(); } return strncpy(d, s, n); }
+          static size_t b_fwrite_chk(const void *p, size_t s, size_t n, FILE *f, size_t bs) { if (s && n > bs / s) { L("*** __fwrite_chk: overflow\n"); abort(); } return fwrite(p, s, n, xf(f)); }
+          static size_t b_fread_chk(void *p, size_t s, size_t n, FILE *f, size_t bs) { if (s && n > bs / s) { L("*** __fread_chk: overflow\n"); abort(); } return fread(p, s, n, xf(f)); }
+
+          static int *b_errno(void) { return &errno; }
+          static int g_droid_n;
+          static int b_android_log_write(int prio, const char *tag, const char *text) {
+            if (g_droid_n++ < 4000) L("[droid %d/%s] %s%s", prio, tag ? tag : "?", text ? text : "", (text && text[0] && text[strlen(text) - 1] == '\n') ? "" : "\n");
+            return 1;
+          }
+          static int b_android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+            char buf[1024]; vsnprintf(buf, sizeof buf, fmt ? fmt : "", ap);
+            return b_android_log_write(prio, tag, buf);
+          }
+          static int b_android_log_print(int prio, const char *tag, const char *fmt, ...) {
+            va_list ap; int r; va_start(ap, fmt); r = b_android_log_vprint(prio, tag, fmt, ap); va_end(ap); return r;
+          }
+          static void b_assert2(const char *file, int line, const char *func, const char *msg) {
+            L("\n*** ASSERT bionic: %s:%d (%s): %s ***\n", file, line, func, msg);
+            abort();
+          }
+          static void b_set_abort_message(const char *msg) { L("[droid] android_set_abort_message: %s\n", msg ? msg : "(null)"); }
+          static int b_system_property_get(const char *name, char *value) {
+            static int n;
+            const char *v = "";
+            if (name && !strcmp(name, "ro.build.version.sdk")) v = "30";
+            else if (name && !strcmp(name, "ro.build.version.release")) v = "11";
+            else if (name && !strcmp(name, "ro.product.model")) v = "muOS";
+            if (n++ < 20) L("[droid] __system_property_get(\"%s\") -> \"%s\"\n", name ? name : "?", v);
+            if (value) strcpy(value, v);
+            return (int)strlen(v);
+          }
+          extern int __xpg_strerror_r(int, char *, size_t);
+          static int b_strerror_r(int e, char *buf, size_t n) { return __xpg_strerror_r(e, buf, n); }  /* bionic = versi XSI (int) */
+
+          /* --- asset APK: stub M2 (dibaca nyata di M3) --- */
+          static char g_amgr_token[8];
+          static void *b_AAssetManager_fromJava(void *env, void *obj) { (void)env; (void)obj; L("[asset] AAssetManager_fromJava\n"); return g_amgr_token; }
+          static void *b_AAssetManager_open(void *m, const char *fn, int mode) { (void)m; L("[asset] AAssetManager_open(\"%s\", %d) -> NULL (belum diimplementasi, M3)\n", fn ? fn : "?", mode); return NULL; }
+          static long b_AAsset_getLength(void *a) { (void)a; return 0; }
+          static int b_AAsset_read(void *a, void *buf, size_t n) { (void)a; (void)buf; (void)n; return -1; }
+          static void b_AAsset_close(void *a) { (void)a; }
+
+          /* --- dl_iterate_phdr: unwinder C++ (statis di libc++_shared) memakai ini untuk mencari .eh_frame. Modul yang kita muat
+           *     sendiri TIDAK terlihat oleh glibc, jadi laporkan sendiri lalu lanjut ke daftar glibc. --- */
+          static int b_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
+            int i, r;
+            for (i = 0; i < nmods; i++) {
+              const Elf64_Ehdr *eh = (const Elf64_Ehdr *)mods[i].file;
+              struct dl_phdr_info info;
+              memset(&info, 0, sizeof info);
+              info.dlpi_addr = (ElfW(Addr))mods[i].bias;
+              info.dlpi_name = mods[i].name;
+              info.dlpi_phdr = (const ElfW(Phdr) *)(mods[i].file + eh->e_phoff);
+              info.dlpi_phnum = eh->e_phnum;
+              info.dlpi_adds = (unsigned long long)nmods;
+              r = cb(&info, sizeof info, data);
+              if (r) return r;
+            }
+            return dl_iterate_phdr(cb, data);
+          }
+
+          typedef struct { const char *name; void *addr; } Shim;
+          static const Shim shim[] = {
+            {"__errno", (void *)b_errno}, {"__android_log_print", (void *)b_android_log_print}, {"__android_log_vprint", (void *)b_android_log_vprint},
+            {"__android_log_write", (void *)b_android_log_write}, {"__assert2", (void *)b_assert2}, {"android_set_abort_message", (void *)b_set_abort_message},
+            {"__system_property_get", (void *)b_system_property_get}, {"__sF", bionic_sF},
+            {"__strlen_chk", (void *)b_strlen_chk}, {"__strncpy_chk2", (void *)b_strncpy_chk2}, {"__fwrite_chk", (void *)b_fwrite_chk}, {"__fread_chk", (void *)b_fread_chk},
+            {"fprintf", (void *)b_fprintf}, {"fputs", (void *)b_fputs}, {"fputc", (void *)b_fputc}, {"fwrite", (void *)b_fwrite}, {"fflush", (void *)b_fflush},
+            {"setjmp", (void *)_setjmp}, {"strerror_r", (void *)b_strerror_r}, {"dl_iterate_phdr", (void *)b_dl_iterate_phdr},
+            {"AAssetManager_fromJava", (void *)b_AAssetManager_fromJava}, {"AAssetManager_open", (void *)b_AAssetManager_open},
+            {"AAsset_getLength", (void *)b_AAsset_getLength}, {"AAsset_read", (void *)b_AAsset_read}, {"AAsset_close", (void *)b_AAsset_close},
+            {NULL, NULL}
+          };
+          static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
+
+          /* ======================= JNI palsu (objek sederhana + log panggilan Java) ======================= */
+          typedef union { int32_t i; int64_t j; float f; double d; void *l; } jv;
+
+          static const void *g_jni_table[256];
+          static const void *g_vm_table[16];
+          static const void *g_envobj = g_jni_table;
+          static const void *g_vmobj = g_vm_table;
+          static char *reg_str[4096];
+          static int reg_n, obj_serial;
+
+          static void *mk_handle(const char *s) {
+            int i;
+            for (i = 0; i < reg_n; i++) if (strcmp(reg_str[i], s) == 0) return (void *)(uintptr_t)(0x70000000u + (uint32_t)i * 4u);
+            if (reg_n >= 4096) return (void *)(uintptr_t)0x70000000u;
+            reg_str[reg_n] = strdup(s);
+            return (void *)(uintptr_t)(0x70000000u + (uint32_t)(reg_n++) * 4u);
+          }
+          static const char *h2s(void *h) {
+            uintptr_t v = (uintptr_t)h;
+            if (v >= 0x70000000u && ((v - 0x70000000u) / 4u) < (uintptr_t)reg_n) return reg_str[(v - 0x70000000u) / 4u];
+            return "?";
+          }
+          static void *mk_obj(const char *cls) { char b[200]; snprintf(b, sizeof b, "obj:%s#%d", cls, ++obj_serial); return mk_handle(b); }
+
+          typedef struct { char cls[96]; char name[64]; char sig[128]; int is_static; unsigned count; } MInfo;
+          static MInfo minfo[512];
+          static int nminfo;
+          static int jlog_budget = 600;
+
+          static void *mk_method(const char *cls, const char *name, const char *sig, int st) {
+            int i;
+            for (i = 0; i < nminfo; i++)
+              if (!strcmp(minfo[i].cls, cls) && !strcmp(minfo[i].name, name) && !strcmp(minfo[i].sig, sig) && minfo[i].is_static == st)
+                return (void *)(uintptr_t)(0x71000000u + (uint32_t)i * 4u);
+            if (nminfo >= 512) i = 511; else i = nminfo++;
+            snprintf(minfo[i].cls, sizeof minfo[i].cls, "%s", cls);
+            snprintf(minfo[i].name, sizeof minfo[i].name, "%s", name);
+            snprintf(minfo[i].sig, sizeof minfo[i].sig, "%s", sig);
+            minfo[i].is_static = st; minfo[i].count = 0;
+            L("[JNI] %s: %s.%s%s\n", st ? "GetStaticMethodID" : "GetMethodID", cls, name, sig);
+            return (void *)(uintptr_t)(0x71000000u + (uint32_t)i * 4u);
+          }
+          static MInfo *mi_get(void *mid) {
+            uintptr_t v = (uintptr_t)mid;
+            if (v >= 0x71000000u && ((v - 0x71000000u) / 4u) < (uintptr_t)nminfo) return &minfo[(v - 0x71000000u) / 4u];
+            return NULL;
+          }
+
+          static int sig_nargs(const char *sig) {
+            const char *p = sig + 1; int n = 0;
+            while (*p && *p != ')') {
+              while (*p == '[') p++;
+              if (*p == 'L') { while (*p && *p != ';') p++; }
+              if (*p) p++;
+              n++;
+            }
+            return n;
+          }
+          static int collect_va(const char *sig, va_list ap, jv *out) {
+            const char *p = sig + 1; int n = 0;
+            while (*p && *p != ')' && n < 16) {
+              int arr = 0;
+              memset(&out[n], 0, sizeof out[n]);
+              while (*p == '[') { arr = 1; p++; }
+              if (*p == 'L' || arr) {
+                out[n].l = va_arg(ap, void *);
+                if (*p == 'L') { while (*p && *p != ';') p++; }
+              } else switch (*p) {
+                case 'J': out[n].j = va_arg(ap, int64_t); break;
+                case 'F': out[n].f = (float)va_arg(ap, double); break;
+                case 'D': out[n].d = va_arg(ap, double); break;
+                default: out[n].i = va_arg(ap, int); break;
+              }
+              if (*p) p++;
+              n++;
+            }
+            return n;
+          }
+          static void fmt_args(const MInfo *m, const jv *a, char *buf, size_t sz) {
+            const char *p = m->sig + 1; int n = 0; size_t o = 0;
+            buf[0] = 0;
+            while (*p && *p != ')' && n < 16 && o + 80 < sz) {
+              int arr = 0;
+              while (*p == '[') { arr = 1; p++; }
+              if (*p == 'L' || arr) {
+                const char *s = h2s(a[n].l);
+                if (*s != '?' && strncmp(s, "obj:", 4) != 0) o += (size_t)snprintf(buf + o, sz - o, "\"%.60s\"", s);
+                else o += (size_t)snprintf(buf + o, sz - o, "%p", a[n].l);
+                if (*p == 'L') { while (*p && *p != ';') p++; }
+              } else switch (*p) {
+                case 'J': o += (size_t)snprintf(buf + o, sz - o, "%lld", (long long)a[n].j); break;
+                case 'F': o += (size_t)snprintf(buf + o, sz - o, "%g", (double)a[n].f); break;
+                case 'D': o += (size_t)snprintf(buf + o, sz - o, "%g", a[n].d); break;
+                default: o += (size_t)snprintf(buf + o, sz - o, "%d", a[n].i); break;
+              }
+              if (*p) p++;
+              n++;
+              if (*p && *p != ')') o += (size_t)snprintf(buf + o, sz - o, ", ");
+            }
+          }
+
+          /* semua panggilan native -> Java lewat sini: di-log lengkap dengan argumen; nilai balik default (0 / string kosong) */
+          static void java_invoke(void *mid, const jv *a, jv *r) {
+            MInfo *m = mi_get(mid);
+            const char *rp;
+            char rt, args[400];
+            memset(r, 0, sizeof *r);
+            if (!m) { L("[Java] methodID tak dikenal: %p\n", mid); return; }
+            rp = strchr(m->sig, ')');
+            rt = rp ? rp[1] : 'V';
+            m->count++;
+            fmt_args(m, a, args, sizeof args);
+            if (jlog_budget > 0 || m->count <= 3) { L("[Java] %s.%s(%s) -> %c\n", m->cls, m->name, args, rt); if (jlog_budget > 0) jlog_budget--; }
+            if (rt == 'L' && rp && !strcmp(rp + 1, "Ljava/lang/String;")) r->l = mk_handle("");
+          }
+
+          #define PREP_VA(mid, ap, a) do { MInfo *mi_ = mi_get(mid); if (mi_) collect_va(mi_->sig, ap, a); } while (0)
+
+          #define DEFCALL(NAME, CT, CONV) \
+            static CT j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; } \
+            static CT j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); return CONV; } \
+            static CT j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); return CONV; }
+
+          DEFCALL(Object, void *, r.l)
+          DEFCALL(Boolean, uint8_t, (uint8_t)r.i)
+          DEFCALL(Byte, int8_t, (int8_t)r.i)
+          DEFCALL(Char, uint16_t, (uint16_t)r.i)
+          DEFCALL(Short, int16_t, (int16_t)r.i)
+          DEFCALL(Int, int32_t, r.i)
+          DEFCALL(Long, int64_t, r.j)
+          DEFCALL(Float, float, r.f)
+          DEFCALL(Double, double, r.d)
+
+          #define DEFCALLV(NAME) \
+            static void j_Call##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_Call##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); } \
+            static void j_CallStatic##NAME##Method(void *env, void *o, void *mid, ...) { va_list ap; jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); va_start(ap, mid); PREP_VA(mid, ap, a); va_end(ap); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodV(void *env, void *o, void *mid, va_list ap) { jv a[16], r; (void)env; (void)o; memset(a, 0, sizeof a); PREP_VA(mid, ap, a); java_invoke(mid, a, &r); } \
+            static void j_CallStatic##NAME##MethodA(void *env, void *o, void *mid, const jv *args) { jv r; (void)env; (void)o; java_invoke(mid, args, &r); }
+          DEFCALLV(Void)
+
+          static int jni_trap(int i) { L("[JNI] slot %d (%s) dipanggil, belum diimplementasi -> return 0\n", i, jni_names[i]); return 0; }
+
+          static int j_GetVersion(void *env) { (void)env; return 0x00010006; }
+          static void *j_FindClass(void *env, const char *n) { (void)env; L("[JNI] FindClass(\"%s\")\n", n); return mk_handle(n); }
+          static void *j_GetObjectClass(void *env, void *o) {
+            const char *s = h2s(o); char b[160]; const char *p, *q; (void)env;
+            if (!strncmp(s, "obj:", 4)) { p = s + 4; q = strrchr(p, '#'); snprintf(b, sizeof b, "%.*s", q ? (int)(q - p) : (int)strlen(p), p); return mk_handle(b); }
+            return mk_handle("(object-class)");
+          }
+          static void *j_GetMethodID(void *env, void *cls, const char *n, const char *sig) { (void)env; return mk_method(h2s(cls), n, sig, 0); }
+          static void *j_GetStaticMethodID(void *env, void *cls, const char *n, const char *sig) { (void)env; return mk_method(h2s(cls), n, sig, 1); }
+          static void *j_GetFieldID(void *env, void *cls, const char *n, const char *sig) {
+            char buf[512]; (void)env;
+            L("[JNI] GetFieldID/GetStaticFieldID(%s, \"%s\", \"%s\")\n", h2s(cls), n, sig);
+            snprintf(buf, sizeof buf, "F:%s:%s%s", h2s(cls), n, sig);
+            return mk_handle(buf);
+          }
+          static void *j_NewObject(void *env, void *cls, void *mid, ...) { (void)env; (void)mid; L("[JNI] NewObject(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_NewObjectV(void *env, void *cls, void *mid, va_list ap) { (void)env; (void)mid; (void)ap; L("[JNI] NewObjectV(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_NewObjectA(void *env, void *cls, void *mid, const jv *a) { (void)env; (void)mid; (void)a; L("[JNI] NewObjectA(%s)\n", h2s(cls)); return mk_obj(h2s(cls)); }
+          static void *j_AllocObject(void *env, void *cls) { (void)env; return mk_obj(h2s(cls)); }
+          static void *j_ident(void *env, void *o) { (void)env; return o; }
+          static void j_void2(void *env, void *o) { (void)env; (void)o; }
+          static void j_void1(void *env) { (void)env; }
+          static int j_zero1(void *env) { (void)env; return 0; }
+          static int j_zero2(void *env, int x) { (void)env; (void)x; return 0; }
+          static void *j_NewStringUTF(void *env, const char *s) { (void)env; return mk_handle(s ? s : ""); }
+          static int j_GetStringUTFLength(void *env, void *s) { (void)env; return (int)strlen(h2s(s)); }
+          static const char *j_GetStringUTFChars(void *env, void *s, unsigned char *copy) { (void)env; if (copy) *copy = 0; return h2s(s); }
+          static void j_ReleaseStringUTFChars(void *env, void *s, const char *c) { (void)env; (void)s; (void)c; }
+          static int j_GetStringLength(void *env, void *s) { (void)env; return (int)strlen(h2s(s)); }
+          typedef struct { const char *name; const char *sig; void *fn; } NativeMethod;
+          static int j_RegisterNatives(void *env, void *cls, const NativeMethod *m, int n) {
+            int i; (void)env;
+            L("[JNI] RegisterNatives(%s, %d metode)\n", h2s(cls), n);
+            for (i = 0; i < n; i++) L("[JNI]   %s %s -> %p\n", m[i].name, m[i].sig, m[i].fn);
+            return 0;
+          }
+          static int j_GetJavaVM(void *env, void **vm) { (void)env; *vm = (void *)&g_vmobj; return 0; }
+          static int vm_Destroy(void *vm) { (void)vm; return 0; }
+          static int vm_Attach(void *vm, void **penv, void *args) { (void)vm; (void)args; *penv = (void *)&g_envobj; return 0; }
+          static int vm_GetEnv(void *vm, void **penv, int ver) { static int n; (void)vm; *penv = (void *)&g_envobj; if (n++ < 10) L("[JNI] GetEnv(versi 0x%x)\n", ver); return 0; }
+
+          #define SETFAM(base, N) do { g_jni_table[base] = (void *)j_Call##N##Method; g_jni_table[base + 1] = (void *)j_Call##N##MethodV; g_jni_table[base + 2] = (void *)j_Call##N##MethodA; \
+            g_jni_table[base + 80] = (void *)j_CallStatic##N##Method; g_jni_table[base + 81] = (void *)j_CallStatic##N##MethodV; g_jni_table[base + 82] = (void *)j_CallStatic##N##MethodA; } while (0)
+
+          static void init_jni(void) {
+            int i;
+            for (i = 0; i < 256; i++) g_jni_table[i] = jstubs[i];
+            g_jni_table[4] = (void *)j_GetVersion;   g_jni_table[6] = (void *)j_FindClass;
+            g_jni_table[15] = (void *)j_zero1;       g_jni_table[16] = (void *)j_void1;
+            g_jni_table[17] = (void *)j_void1;       g_jni_table[19] = (void *)j_zero2;
+            g_jni_table[20] = (void *)j_ident;       g_jni_table[21] = (void *)j_ident;
+            g_jni_table[22] = (void *)j_void2;       g_jni_table[23] = (void *)j_void2;
+            g_jni_table[25] = (void *)j_ident;       g_jni_table[26] = (void *)j_zero2;
+            g_jni_table[27] = (void *)j_AllocObject; g_jni_table[28] = (void *)j_NewObject;
+            g_jni_table[29] = (void *)j_NewObjectV;  g_jni_table[30] = (void *)j_NewObjectA;
+            g_jni_table[31] = (void *)j_GetObjectClass; g_jni_table[33] = (void *)j_GetMethodID;
+            SETFAM(34, Object); SETFAM(37, Boolean); SETFAM(40, Byte); SETFAM(43, Char); SETFAM(46, Short);
+            SETFAM(49, Int);    SETFAM(52, Long);    SETFAM(55, Float); SETFAM(58, Double); SETFAM(61, Void);
+            g_jni_table[94] = (void *)j_GetFieldID;  g_jni_table[113] = (void *)j_GetStaticMethodID;
+            g_jni_table[144] = (void *)j_GetFieldID;
+            g_jni_table[164] = (void *)j_GetStringLength;
+            g_jni_table[167] = (void *)j_NewStringUTF; g_jni_table[168] = (void *)j_GetStringUTFLength;
+            g_jni_table[169] = (void *)j_GetStringUTFChars; g_jni_table[170] = (void *)j_ReleaseStringUTFChars;
+            g_jni_table[215] = (void *)j_RegisterNatives; g_jni_table[217] = (void *)j_zero2;
+            g_jni_table[218] = (void *)j_zero2;      g_jni_table[219] = (void *)j_GetJavaVM;
+            g_jni_table[226] = (void *)j_ident;      g_jni_table[227] = (void *)j_void2;
+            g_jni_table[228] = (void *)j_zero1;
+            g_vm_table[3] = (void *)vm_Destroy; g_vm_table[4] = (void *)vm_Attach; g_vm_table[5] = (void *)vm_Destroy;
+            g_vm_table[6] = (void *)vm_GetEnv;  g_vm_table[7] = (void *)vm_Attach;
+          }
+
+          /* ======================= pemuat ELF64 ======================= */
+          static int read_file(const char *path, uint8_t **buf, size_t *len) {
+            FILE *f = fopen(path, "rb");
+            long n;
+            if (!f) return -1;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            *buf = malloc((size_t)n);
+            if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); return -1; }
+            fclose(f); *len = (size_t)n;
+            return 0;
+          }
+
+          static int load_mod(const char *dir, const char *name, Mod **out) {
+            char path[512];
+            Mod *m;
+            const Elf64_Ehdr *eh;
+            const Elf64_Phdr *ph;
+            uint64_t minv = ~0ULL, maxv = 0;
+            size_t align = 0x4000;
+            void *raw;
+            int i, dyn_found = 0;
+            if (nmods >= MAXMOD) return -1;
+            m = &mods[nmods];
+            memset(m, 0, sizeof *m);
+            snprintf(m->name, sizeof m->name, "%s", name);
+            snprintf(path, sizeof path, "%s/%s", dir, name);
+            if (read_file(path, &m->file, &m->fsize) != 0) { L("GAGAL membaca %s\n", path); return -1; }
+            eh = (const Elf64_Ehdr *)m->file;
+            if (m->fsize < sizeof *eh || memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS64 || eh->e_machine != EM_AARCH64 || eh->e_type != ET_DYN) {
+              L("%s: bukan ELF AArch64 shared object\n", name); return -1;
+            }
+            ph = (const Elf64_Phdr *)(m->file + eh->e_phoff);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if (ph[i].p_vaddr < minv) minv = ph[i].p_vaddr;
+              if (ph[i].p_vaddr + ph[i].p_memsz > maxv) maxv = ph[i].p_vaddr + ph[i].p_memsz;
+              if (ph[i].p_align > align) align = (size_t)ph[i].p_align;
+            }
+            minv &= ~(uint64_t)(PAGE - 1); maxv = (maxv + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+            m->span = (size_t)(maxv - minv);
+            raw = mmap(NULL, m->span + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) { L("%s: mmap gagal\n", name); return -1; }
+            m->base = (uint8_t *)(((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1));
+            m->bias = (uintptr_t)m->base - (uintptr_t)minv;
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              if ((size_t)ph[i].p_offset + ph[i].p_filesz > m->fsize) { L("%s: segmen melewati ujung file\n", name); return -1; }
+              memcpy((void *)(m->bias + ph[i].p_vaddr), m->file + ph[i].p_offset, ph[i].p_filesz);
+            }
+            for (i = 0; i < eh->e_phnum; i++) {
+              if (ph[i].p_type == PT_TLS) { L("%s: punya PT_TLS (belum didukung)\n", name); return -1; }
+              if (ph[i].p_type == PT_DYNAMIC) {
+                const Elf64_Dyn *d = (const Elf64_Dyn *)(m->bias + ph[i].p_vaddr);
+                dyn_found = 1;
+                for (; d->d_tag != DT_NULL; d++) {
+                  switch (d->d_tag) {
+                    case DT_SYMTAB: m->sym = (Elf64_Sym *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_STRTAB: m->str = (const char *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_RELA: m->rela = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_RELASZ: m->nrela = (uint32_t)(d->d_un.d_val / sizeof(Elf64_Rela)); break;
+                    case DT_JMPREL: m->jrela = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_PLTRELSZ: m->njrela = (uint32_t)(d->d_un.d_val / sizeof(Elf64_Rela)); break;
+                    case DT_INIT: m->init = d->d_un.d_val; break;
+                    case DT_INIT_ARRAY: m->iarr = (uint64_t *)(m->bias + d->d_un.d_ptr); break;
+                    case DT_INIT_ARRAYSZ: m->niarr = (uint32_t)(d->d_un.d_val / 8); break;
+                    case DT_REL: case DT_RELR: case 36 + 1: case 0x6000000f: case 0x60000011: case DT_TEXTREL:
+                      L("%s: tipe relokasi tidak didukung (tag 0x%x)\n", name, (unsigned)d->d_tag); return -1;
+                    default: break;
                   }
                 }
               }
             }
-          }
-
-          static const char *dynstr(Image *im, DynInfo *d, uint64_t off) {
-            char *s;
-            if (!d->strtab || off >= d->strsz) return "(bad-dynstr-offset)";
-            s = (char *)vaddr_ptr(im, d->strtab + off, d->strsz - off);
-            if (!s) return "(dynstr-not-file-backed)";
-            if (!memchr(s, 0, (size_t)(d->strsz - off))) return "(unterminated-dynstr)";
-            return s;
-          }
-
-          static void count_rela(Image *im, DynInfo *d, uint64_t va, uint64_t bytes, const char *label) {
-            Elf64_Rela *r;
-            uint64_t off, n, i, counts[2048] = {0};
-            if (!va || !bytes) { printf("  %-12s: none\n", label); return; }
-            if (d->relaent != sizeof(Elf64_Rela)) {
-              printf("  %-12s: unsupported/invalid RELA entry size=%" PRIu64 "\n", label, d->relaent);
-              return;
+            if (!dyn_found || !m->sym || !m->str) { L("%s: section dinamis tidak lengkap\n", name); return -1; }
+            if (eh->e_shoff && (size_t)eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf64_Shdr) <= m->fsize) {
+              const Elf64_Shdr *sh = (const Elf64_Shdr *)(m->file + eh->e_shoff);
+              for (i = 0; i < eh->e_shnum; i++) if (sh[i].sh_type == SHT_DYNSYM) m->nsym = (int)(sh[i].sh_size / sizeof(Elf64_Sym));
             }
-            off = vaddr_to_offset(im, va, bytes);
-            if (off == UINT64_MAX) { printf("  %-12s: table not file-backed / invalid range\n", label); return; }
-            n = bytes / sizeof(Elf64_Rela);
-            r = (Elf64_Rela *)(im->data + off);
-            for (i = 0; i < n; i++) {
-              unsigned t = (unsigned)ELF64_R_TYPE(r[i].r_info);
-              if (t < 2048) counts[t]++;
-            }
-            printf("  %-12s: VA=0x%" PRIx64 " bytes=%" PRIu64 " entries=%" PRIu64 "\n", label, va, bytes, n);
-            for (i = 0; i < 2048; i++) if (counts[i])
-              printf("      %-16s (%" PRIu64 ") : %" PRIu64 "\n", relname((unsigned)i), i, counts[i]);
-          }
-
-          static void report(const char *path) {
-            Image im;
-            DynInfo d;
-            size_t i;
-            unsigned loads = 0, tls = 0;
-            uint64_t maxalign = 0, minva = UINT64_MAX, maxva = 0;
-            if (load_image(path, &im)) exit(1);
-            printf("== M2 ELF dry-run: %s ==\n", path);
-            printf("File bytes: %zu | ELF type=%u | machine=%u | entry=0x%" PRIx64 "\n",
-                   im.size, im.eh->e_type, im.eh->e_machine, (uint64_t)im.eh->e_entry);
-            for (i = 0; i < im.phnum; i++) {
-              Elf64_Phdr *p = &im.ph[i];
-              if (p->p_type == PT_LOAD) {
-                loads++;
-                if (p->p_align > maxalign) maxalign = p->p_align;
-                if (p->p_vaddr < minva) minva = p->p_vaddr;
-                if (p->p_vaddr + p->p_memsz > maxva) maxva = p->p_vaddr + p->p_memsz;
-                printf("PT_LOAD[%zu]: off=0x%" PRIx64 " VA=0x%" PRIx64 " filesz=0x%" PRIx64
-                       " memsz=0x%" PRIx64 " align=0x%" PRIx64 " flags=%c%c%c\n",
-                       i, p->p_offset, p->p_vaddr, p->p_filesz, p->p_memsz, p->p_align,
-                       (p->p_flags & PF_R) ? 'R' : '-', (p->p_flags & PF_W) ? 'W' : '-',
-                       (p->p_flags & PF_X) ? 'X' : '-');
-              } else if (p->p_type == PT_TLS) {
-                tls++;
-                printf("PT_TLS[%zu]: VA=0x%" PRIx64 " filesz=0x%" PRIx64 " memsz=0x%" PRIx64 " align=0x%" PRIx64 "\n",
-                       i, p->p_vaddr, p->p_filesz, p->p_memsz, p->p_align);
-              } else if (p->p_type == PT_DYNAMIC) {
-                printf("PT_DYNAMIC[%zu]: off=0x%" PRIx64 " bytes=0x%" PRIx64 "\n", i, p->p_offset, p->p_filesz);
-              }
-            }
-            printf("Segments: PT_LOAD=%u max_align=0x%" PRIx64 " PT_TLS=%u"
-                   " | image VA range=[0x%" PRIx64 ",0x%" PRIx64 ")\n",
-                   loads, maxalign, tls, minva, maxva);
-            read_dynamic(&im, &d);
-            puts("\n-- DT_NEEDED / dynamic tags --");
-            for (i = 0; i < d.nneeded; i++) printf("DT_NEEDED: %s\n", dynstr(&im, &d, d.needed[i]));
-            if (d.soname) printf("DT_SONAME: %s\n", dynstr(&im, &d, d.soname));
-            printf("DT_SYMTAB=0x%" PRIx64 " DT_SYMENT=%" PRIu64 " DT_STRTAB=0x%" PRIx64 " DT_STRSZ=%" PRIu64 "\n",
-                   d.symtab, d.syment, d.strtab, d.strsz);
-            printf("DT_PLTGOT=0x%" PRIx64 " DT_FLAGS=0x%" PRIx64 " DT_FLAGS_1=0x%" PRIx64 "\n",
-                   d.pltgot, d.flags, d.flags1);
-            if (d.init) printf("DT_INIT present at VA 0x%" PRIx64 " (NOT called)\n", d.init);
-            if (d.init_array) printf("DT_INIT_ARRAY present at VA 0x%" PRIx64 " bytes=%" PRIu64 " (NOT called)\n", d.init_array, d.init_arraysz);
-            puts("\n-- Relocation tables (inspection only; no relocation writes) --");
-            count_rela(&im, &d, d.rela, d.relasz, "DT_RELA");
-            if (d.jmprel && d.pltrelsz && d.pltrel == DT_RELA)
-              count_rela(&im, &d, d.jmprel, d.pltrelsz, "DT_JMPREL");
-            else if (d.jmprel && d.pltrelsz)
-              printf("  DT_JMPREL: present but PLTREL=%" PRIu64 " (not RELA; inspect separately)\n", d.pltrel);
-            if (d.rel && d.relsz)
-              printf("  DT_REL: present VA=0x%" PRIx64 " bytes=%" PRIu64 " (REL parser not enabled in this build)\n", d.rel, d.relsz);
-            if (d.relr && d.relrsz)
-              printf("  DT_RELR: present VA=0x%" PRIx64 " bytes=%" PRIu64 " entry=%" PRIu64 " (RELR decoder not enabled)\n", d.relr, d.relrsz, d.relrent);
-            if (d.android_rela || d.android_relasz || d.android_rel || d.android_relsz)
-              printf("  Android packed relocation tags found (APS2): RELA=0x%" PRIx64 "/%" PRIu64 " REL=0x%" PRIx64 "/%" PRIu64 " (decoder not enabled)\n",
-                     d.android_rela, d.android_relasz, d.android_rel, d.android_relsz);
-            puts("\nSAFETY: dry-run only. No executable mapping, relocation writes, constructors, JNI_OnLoad, or game code ran.");
-            free(im.data);
-          }
-
-          int main(int argc, char **argv) {
-            int i;
-            if (argc < 2) {
-              fprintf(stderr, "Usage: %s lib-or-elf.so [another.so ...]\n", argv[0]);
-              return 2;
-            }
-            for (i = 1; i < argc; i++) report(argv[i]);
+            if (m->nsym <= 0) { L("%s: jumlah simbol tidak diketahui\n", name); return -1; }
+            m->rval = calloc((size_t)m->nsym, sizeof(uint64_t));
+            m->rhave = calloc((size_t)m->nsym, 1);
+            nmods++;
+            *out = m;
+            L("[load] %s: base=%p span=0x%zx bias=0x%lx simbol=%d rela=%u jmprel=%u init_array=%u\n", name, (void *)m->base, m->span, (unsigned long)m->bias, m->nsym, m->nrela, m->njrela, m->niarr);
             return 0;
           }
-          EOF_C
 
-          cat > out/DoodleM2.sh <<'EOF_SH'
+          static void *mod_find(const Mod *m, const char *name) {
+            int i;
+            for (i = 1; i < m->nsym; i++) {
+              const Elf64_Sym *s = &m->sym[i];
+              if (s->st_shndx != SHN_UNDEF && s->st_name && ELF64_ST_BIND(s->st_info) != STB_LOCAL && strcmp(m->str + s->st_name, name) == 0) return (void *)(m->bias + s->st_value);
+            }
+            return NULL;
+          }
+
+          static uint64_t resolve_uncached(Mod *self, const Elf64_Sym *s) {
+            const char *n = self->str + s->st_name;
+            int i;
+            void *p;
+            if (s->st_shndx != SHN_UNDEF) { cnt_self++; return s->st_shndx == SHN_ABS ? s->st_value : (uint64_t)(self->bias + s->st_value); }
+            for (i = 0; i < nmods; i++) if (&mods[i] != self && (p = mod_find(&mods[i], n))) { cnt_mod++; return (uint64_t)(uintptr_t)p; }
+            for (i = 0; shim[i].name; i++) if (strcmp(shim[i].name, n) == 0) { cnt_shim++; return (uint64_t)(uintptr_t)shim[i].addr; }
+            if ((p = dlsym(RTLD_DEFAULT, n))) { cnt_libc++; return (uint64_t)(uintptr_t)p; }
+            if (h_gles && (p = dlsym(h_gles, n))) { cnt_gl++; return (uint64_t)(uintptr_t)p; }
+            if (h_egl && (p = dlsym(h_egl, n))) { cnt_gl++; return (uint64_t)(uintptr_t)p; }
+            if (ELF64_ST_BIND(s->st_info) == STB_WEAK) { cnt_weak0++; return 0; }
+            for (i = 0; i < nunres; i++) if (strcmp(unres_name[i], n) == 0) return (uint64_t)(uintptr_t)tstubs[i];
+            cnt_unres++;
+            if (nunres < MAXUNRES) { unres_name[nunres] = n; return (uint64_t)(uintptr_t)tstubs[nunres++]; }
+            return (uint64_t)(uintptr_t)tstubs[MAXUNRES - 1];
+          }
+          static uint64_t resolve(Mod *self, uint32_t si) {
+            if (si == 0) return 0;
+            if (!self->rhave[si]) { self->rval[si] = resolve_uncached(self, &self->sym[si]); self->rhave[si] = 1; }
+            return self->rval[si];
+          }
+
+          static int relocate(Mod *m) {
+            int pass, bad = 0;
+            unsigned ntype[2048] = {0};
+            for (pass = 0; pass < 2; pass++) {
+              Elf64_Rela *r = pass ? m->jrela : m->rela;
+              uint32_t n = pass ? m->njrela : m->nrela, k;
+              for (k = 0; k < n; k++) {
+                uint32_t type = (uint32_t)ELF64_R_TYPE(r[k].r_info), si = (uint32_t)ELF64_R_SYM(r[k].r_info);
+                uint64_t *where = (uint64_t *)(m->bias + r[k].r_offset);
+                if (type < 2048) ntype[type]++;
+                switch (type) {
+                  case 0: break;                                                     /* R_AARCH64_NONE */
+                  case 1027: *where = (uint64_t)m->bias + (uint64_t)r[k].r_addend; break;   /* RELATIVE */
+                  case 257: *where = resolve(m, si) + (uint64_t)r[k].r_addend; break;       /* ABS64 */
+                  case 1025: case 1026: *where = resolve(m, si) + (uint64_t)r[k].r_addend; break;  /* GLOB_DAT, JUMP_SLOT */
+                  default: L("[reloc] %s: tipe tidak didukung %u (offset 0x%llx)\n", m->name, type, (unsigned long long)r[k].r_offset); bad++; break;
+                }
+              }
+            }
+            L("[reloc] %s: RELATIVE=%u ABS64=%u GLOB_DAT=%u JUMP_SLOT=%u tak-didukung=%d\n", m->name, ntype[1027], ntype[257], ntype[1025], ntype[1026], bad);
+            return bad;
+          }
+
+          static void protect(Mod *m) {
+            const Elf64_Ehdr *eh = (const Elf64_Ehdr *)m->file;
+            const Elf64_Phdr *ph = (const Elf64_Phdr *)(m->file + eh->e_phoff);
+            size_t np = m->span / PAGE, p;
+            unsigned char *fl = calloc(np, 1);
+            int i;
+            __builtin___clear_cache((char *)m->base, (char *)m->base + m->span);
+            for (i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD) {
+              uintptr_t a = (m->bias + ph[i].p_vaddr) & ~(uintptr_t)(PAGE - 1);
+              uintptr_t e = (m->bias + ph[i].p_vaddr + ph[i].p_memsz + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+              unsigned pr = ((ph[i].p_flags & PF_R) ? PROT_READ : 0) | ((ph[i].p_flags & PF_W) ? PROT_WRITE : 0) | ((ph[i].p_flags & PF_X) ? PROT_EXEC : 0);
+              for (; a < e; a += PAGE) fl[(a - (uintptr_t)m->base) / PAGE] |= (unsigned char)pr;
+            }
+            for (p = 0; p < np; ) {
+              size_t q = p + 1;
+              while (q < np && fl[q] == fl[p]) q++;
+              if (fl[p] && mprotect(m->base + p * PAGE, (q - p) * PAGE, fl[p]) != 0) L("[protect] %s: mprotect gagal: %s\n", m->name, strerror(errno));
+              p = q;
+            }
+            free(fl);
+          }
+
+          extern char **environ;
+          static void run_init(Mod *m) {
+            uint32_t i;
+            if (m->init) { L("[init] %s: DT_INIT di 0x%llx\n", m->name, (unsigned long long)m->init); ((void (*)(void))(m->bias + m->init))(); }
+            for (i = 0; i < m->niarr; i++) {
+              uint64_t f = m->iarr[i];
+              if (f == 0 || f == ~0ULL) continue;
+              L("[init] %s: init_array[%u] = %p (+0x%llx)\n", m->name, i, (void *)(uintptr_t)f, (unsigned long long)(f - m->bias));
+              ((void (*)(int, char **, char **))(uintptr_t)f)(0, NULL, environ);
+            }
+            L("[init] %s: selesai\n", m->name);
+          }
+
+          static int pint(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+
+          /* ======================= uji mandiri (jalan di x86 maupun aarch64) ======================= */
+          static int st_va(const char *sig, ...) {
+            va_list ap; jv a[16]; int n;
+            va_start(ap, sig); n = collect_va(sig, ap, a); va_end(ap);
+            return n == 6 && a[0].i == -5 && a[1].j == 0x123456789aLL && a[2].l == (void *)0x1234 && a[3].i == 7 && a[4].d > 2.49 && a[4].d < 2.51 && a[5].f > 1.49f && a[5].f < 1.51f;
+          }
+          typedef void *(*fn_find_t)(void *, const char *);
+          typedef void *(*fn_mid_t)(void *, void *, const char *, const char *);
+          typedef void (*fn_callv_t)(void *, void *, void *, ...);
+          typedef const char *(*fn_utf_t)(void *, void *, unsigned char *);
+          static int selftest(void) {
+            int ok = 1;
+            void *env = (void *)&g_envobj;
+            char buf[16], tmp[8];
+            L("== selftest ==\n");
+            if (st_va("(IJLjava/lang/String;ZDF)V", -5, 0x123456789aLL, (void *)0x1234, 7, 2.5, 1.5)) L("  collect_va: LULUS\n"); else { L("  collect_va: GAGAL\n"); ok = 0; }
+            if (sig_nargs("(IJ[ILjava/lang/String;[[Ljava/lang/Object;)V") == 5) L("  sig_nargs: LULUS\n"); else { L("  sig_nargs: GAGAL\n"); ok = 0; }
+            if (xf((FILE *)(bionic_sF + 0 * BSF)) == stdin && xf((FILE *)(bionic_sF + 1 * BSF)) == stdout && xf((FILE *)(bionic_sF + 2 * BSF + 40)) == stderr && xf(stdout) == stdout) L("  xf (__sF -> stdio): LULUS\n"); else { L("  xf: GAGAL\n"); ok = 0; }
+            if (b_strlen_chk("abcd", 5) == 4) L("  __strlen_chk: LULUS\n"); else { L("  __strlen_chk: GAGAL\n"); ok = 0; }
+            memset(buf, 'x', sizeof buf); b_strncpy_chk2(buf, "hi", 3, sizeof buf, 3);
+            if (!strcmp(buf, "hi")) L("  __strncpy_chk2: LULUS\n"); else { L("  __strncpy_chk2: GAGAL\n"); ok = 0; }
+            { FILE *f = tmpfile(); char rb[8] = {0};
+              if (f && b_fwrite_chk("abc", 1, 3, f, 3) == 3 && (rewind(f), b_fread_chk(rb, 1, 3, f, sizeof rb)) == 3 && !strcmp(rb, "abc")) L("  __fwrite_chk/__fread_chk (urutan bionic): LULUS\n"); else { L("  fread/fwrite_chk: GAGAL\n"); ok = 0; }
+              if (f) fclose(f); }
+            if (b_system_property_get("ro.build.version.sdk", tmp) == 2 && !strcmp(tmp, "30")) L("  __system_property_get: LULUS\n"); else { L("  __system_property_get: GAGAL\n"); ok = 0; }
+            if (shim_addr("__errno") && shim_addr("dl_iterate_phdr") && shim_addr("__sF") && !shim_addr("tidak_ada_ini")) L("  tabel shim: LULUS\n"); else { L("  tabel shim: GAGAL\n"); ok = 0; }
+            { /* JNI lewat tabel fungsi, persis seperti dipanggil kode native */
+              void **tbl = *(void ***)env;
+              void *cls = ((fn_find_t)tbl[6])(env, "com/joybits/Test");
+              void *mid = ((fn_mid_t)tbl[33])(env, cls, "foo", "(ILjava/lang/String;)V");
+              void *s = ((void *(*)(void *, const char *))tbl[167])(env, "halo");
+              int n0 = nminfo;
+              ((fn_callv_t)tbl[61])(env, mk_obj("com/joybits/Test"), mid, 42, s);
+              if (!strcmp(h2s(cls), "com/joybits/Test") && minfo[0].count == 1 && n0 >= 1 && !strcmp(((fn_utf_t)tbl[169])(env, s, NULL), "halo") && tbl[4] && ((int (*)(void *))tbl[4])(env) == 0x10006) L("  JNI via tabel (FindClass/GetMethodID/NewStringUTF/CallVoidMethod): LULUS\n");
+              else { L("  JNI via tabel: GAGAL\n"); ok = 0; }
+            }
+            L("== selftest %s ==\n", ok ? "SEMUA LULUS" : "ADA YANG GAGAL");
+            return ok ? 0 : 1;
+          }
+
+          /* ======================= main ======================= */
+          int main(int argc, char **argv) {
+            const char *dir = "libs";
+            int stage = 0, timeout = 60, i, do_selftest = 0;
+            Mod *cpp = NULL, *dg = NULL;
+            struct sigaction sa;
+            struct utsname u;
+            stack_t ss0;
+
+            for (i = 1; i < argc; i++) {
+              if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
+              else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = pint(argv[++i]);
+              else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = pint(argv[++i]);
+              else if (argv[i][0] != '-') dir = argv[i];
+            }
+            g_log = fopen("loader_log.txt", "w");
+            L("== doodleloader (Milestone 2) ==\n");
+            if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
+            L("libs: %s | stage=%d timeout=%ds\n", dir, stage, timeout);
+          #if !defined(__aarch64__)
+            L("(bukan aarch64: hanya stage 0 / selftest yang valid; kode game TIDAK akan dijalankan)\n");
+            if (stage > 0) stage = 0;
+          #endif
+
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_sig; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            ss0.ss_sp = malloc(1u << 17); ss0.ss_size = 1u << 17; ss0.ss_flags = 0;
+            if (ss0.ss_sp) sigaltstack(&ss0, NULL);
+            sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+            sigaction(SIGFPE, &sa, NULL);  sigaction(SIGABRT, &sa, NULL);
+            signal(SIGALRM, on_alarm);
+
+            init_jni();
+            if (do_selftest) return selftest();
+            if (tls_guard_check() != 0 && stage > 0) { L("kanari TLS tidak cocok: kode game akan crash 'stack smashing'. Berhenti.\n"); return 1; }
+
+            dlopen("libm.so.6", RTLD_NOW | RTLD_GLOBAL);
+            h_gles = dlopen("libGLESv1_CM.so.1", RTLD_LAZY | RTLD_LOCAL);
+            h_egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+            L("GLESv1_CM: %s | EGL: %s\n", h_gles ? "OK" : "TIDAK ADA", h_egl ? "OK" : "TIDAK ADA");
+
+            if (load_mod(dir, "libc++_shared.so", &cpp) != 0) return 1;
+            if (load_mod(dir, "libdoodle-everything.so", &dg) != 0) return 1;
+            if (relocate(cpp) != 0) return 1;
+            if (relocate(dg) != 0) return 1;
+            protect(cpp); protect(dg);
+
+            L("\n== ringkasan resolusi simbol (unik per modul) ==\n");
+            L("modul sendiri=%d | modul lain (libc++)=%d | shim=%d | glibc=%d | GL/EGL=%d | weak->0=%d | TAK TERSELESAIKAN=%d\n", cnt_self, cnt_mod, cnt_shim, cnt_libc, cnt_gl, cnt_weak0, cnt_unres);
+            for (i = 0; i < nunres; i++) L("  TAK TERSELESAIKAN: %s\n", unres_name[i]);
+            { int k; L("  shim terpakai:"); for (k = 0; shim[k].name; k++) { int u2, hit = 0; for (u2 = 0; u2 < nmods; u2++) { int s; for (s = 1; s < mods[u2].nsym; s++) if (mods[u2].sym[s].st_shndx == SHN_UNDEF && mods[u2].sym[s].st_name && !strcmp(mods[u2].str + mods[u2].sym[s].st_name, shim[k].name)) hit = 1; } if (hit) L(" %s", shim[k].name); } L("\n"); }
+
+            if (stage < 1) { L("\n== stage 0 selesai (tidak ada kode game yang dijalankan) ==\n"); return 0; }
+            if (timeout > 0) alarm((unsigned)timeout);
+
+            L("\n== konstruktor (stage 1) ==\n");
+            run_init(cpp);
+            run_init(dg);
+
+            if (stage >= 2) {
+              void *fn = mod_find(dg, "JNI_OnLoad");
+              L("\n== JNI_OnLoad (stage 2) ==\n");
+              if (!fn) { L("JNI_OnLoad tidak ada\n"); return 1; }
+              L("JNI_OnLoad -> 0x%x\n", ((int (*)(void *, void *))fn)((void *)&g_vmobj, NULL));
+              L("\n== ringkasan panggilan Java (jumlah) ==\n");
+              for (i = 0; i < nminfo; i++) if (minfo[i].count) L("  %5u  %s.%s%s\n", minfo[i].count, minfo[i].cls, minfo[i].name, minfo[i].sig);
+            }
+            L("\n== Milestone 2 selesai (stage %d) ==\n", stage);
+            fflush(NULL);
+            _exit(0);   /* hindari destruktor atexit milik game */
+          }
+          EOF_C2
+          cat > src/gen_stubs.py <<'EOF_PY'
+          # Menghasilkan stubs.inc: nama slot JNI + 256 stub JNI + 64 stub simbol-tak-terselesaikan
+          types = ["Object","Boolean","Byte","Char","Short","Int","Long","Float","Double","Void"]
+          prims = ["Boolean","Byte","Char","Short","Int","Long","Float","Double"]
+          n = {}
+          for i in range(4): n[i] = "reserved%d" % i
+          n[4]="GetVersion"; n[5]="DefineClass"; n[6]="FindClass"; n[7]="FromReflectedMethod"; n[8]="FromReflectedField"
+          n[9]="ToReflectedMethod"; n[10]="GetSuperclass"; n[11]="IsAssignableFrom"; n[12]="ToReflectedField"
+          n[13]="Throw"; n[14]="ThrowNew"; n[15]="ExceptionOccurred"; n[16]="ExceptionDescribe"; n[17]="ExceptionClear"
+          n[18]="FatalError"; n[19]="PushLocalFrame"; n[20]="PopLocalFrame"; n[21]="NewGlobalRef"; n[22]="DeleteGlobalRef"
+          n[23]="DeleteLocalRef"; n[24]="IsSameObject"; n[25]="NewLocalRef"; n[26]="EnsureLocalCapacity"
+          n[27]="AllocObject"; n[28]="NewObject"; n[29]="NewObjectV"; n[30]="NewObjectA"
+          n[31]="GetObjectClass"; n[32]="IsInstanceOf"; n[33]="GetMethodID"
+          i = 34
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "Call%sMethod%s" % (t, s); i += 1
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "CallNonvirtual%sMethod%s" % (t, s); i += 1
+          assert i == 94
+          n[94]="GetFieldID"; i = 95
+          for t in types[:9]: n[i] = "Get%sField" % t; i += 1
+          for t in types[:9]: n[i] = "Set%sField" % t; i += 1
+          assert i == 113
+          n[113]="GetStaticMethodID"; i = 114
+          for t in types:
+              for s in ("", "V", "A"): n[i] = "CallStatic%sMethod%s" % (t, s); i += 1
+          assert i == 144
+          n[144]="GetStaticFieldID"; i = 145
+          for t in types[:9]: n[i] = "GetStatic%sField" % t; i += 1
+          for t in types[:9]: n[i] = "SetStatic%sField" % t; i += 1
+          assert i == 163
+          for k, nm in enumerate(["NewString","GetStringLength","GetStringChars","ReleaseStringChars","NewStringUTF",
+                                  "GetStringUTFLength","GetStringUTFChars","ReleaseStringUTFChars","GetArrayLength",
+                                  "NewObjectArray","GetObjectArrayElement","SetObjectArrayElement"]):
+              n[163 + k] = nm
+          i = 175
+          for t in prims: n[i] = "New%sArray" % t; i += 1
+          for t in prims: n[i] = "Get%sArrayElements" % t; i += 1
+          for t in prims: n[i] = "Release%sArrayElements" % t; i += 1
+          for t in prims: n[i] = "Get%sArrayRegion" % t; i += 1
+          for t in prims: n[i] = "Set%sArrayRegion" % t; i += 1
+          assert i == 215
+          for k, nm in enumerate(["RegisterNatives","UnregisterNatives","MonitorEnter","MonitorExit","GetJavaVM",
+                                  "GetStringRegion","GetStringUTFRegion","GetPrimitiveArrayCritical",
+                                  "ReleasePrimitiveArrayCritical","GetStringCritical","ReleaseStringCritical",
+                                  "NewWeakGlobalRef","DeleteWeakGlobalRef","ExceptionCheck","NewDirectByteBuffer",
+                                  "GetDirectBufferAddress","GetDirectBufferCapacity","GetObjectRefType"]):
+              n[215 + k] = nm
+          assert n[215]=="RegisterNatives" and n[228]=="ExceptionCheck" and n[232]=="GetObjectRefType"
+          assert n[33]=="GetMethodID" and n[113]=="GetStaticMethodID" and n[169]=="GetStringUTFChars" and n[167]=="NewStringUTF"
+          assert n[61]=="CallVoidMethod" and n[141]=="CallStaticVoidMethod" and n[129]=="CallStaticIntMethod"
+          o = []
+          o.append("static const char *const jni_names[256] = {")
+          for k in range(256):
+              o.append('  "%s",' % n.get(k, "slot%d" % k))
+          o.append("};")
+          for k in range(256):
+              o.append("static int jstub_%d(void) { return jni_trap(%d); }" % (k, k))
+          o.append("static void *const jstubs[256] = {")
+          o.append("  " + ", ".join("(void *)jstub_%d" % k for k in range(256)))
+          o.append("};")
+          for k in range(64):
+              o.append("static int tstub_%d(void) { return trap_unres(%d); }" % (k, k))
+          o.append("static void *const tstubs[64] = {")
+          o.append("  " + ", ".join("(void *)tstub_%d" % k for k in range(64)))
+          o.append("};")
+          open("stubs.inc", "w").write("\n".join(o) + "\n")
+          print("stubs.inc ok, nama terisi:", len(n))
+          EOF_PY
+          cat > out/DoodleProbe.sh <<'EOF_SH1'
           #!/bin/bash
-          # M2: static ELF dry-run only; never runs the Android game library.
+          # Probe Doodle God HD (Milestone 1, arm64). Hanya membaca, tidak mengubah apa pun.
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
+
           XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
           if [ -d "/opt/system/Tools/PortMaster/" ]; then
             controlfolder="/opt/system/Tools/PortMaster"
           elif [ -d "/opt/tools/PortMaster/" ]; then
@@ -308,55 +1226,103 @@ jobs:
           else
             controlfolder="/roms/ports/PortMaster"
           fi
-          if [ -f "$controlfolder/control.txt" ]; then
-            source "$controlfolder/control.txt"
-            [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
-          fi
-          SELF="$(cd "$(dirname "$0")" && pwd)"
-          GAMEDIR="/${directory:-roms}/ports/doodle_god"
-          [ -d "$GAMEDIR" ] || GAMEDIR="$SELF/doodle_god"
-          mkdir -p "$GAMEDIR"
-          cd "$GAMEDIR" || exit 1
-          chmod +x "$SELF/elfdry64" 2>/dev/null
-          {
-            echo "== Doodle God HD M2 dry-run =="
-            uname -a
-            echo "GAMEDIR=$GAMEDIR"
-          } > "$GAMEDIR/m2_stdout.txt"
-          : > "$GAMEDIR/m2_report.txt"
-          if [ ! -f "$GAMEDIR/libs/libdoodle-everything.so" ]; then
-            echo "Missing libs/libdoodle-everything.so in $GAMEDIR" | tee -a "$GAMEDIR/m2_report.txt" >> "$GAMEDIR/m2_stdout.txt"
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/doodle_god"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/doodle_god"
+
+          cd "$GAMEDIR" || {
+            echo "folder doodle_god tidak ketemu. Dicari di: /$directory/ports/doodle_god dan di sebelah script ini." > "$(dirname "$0")/probe_error.txt"
+            exit 1
+          }
+
+          chmod +x ./elfprobe64 2>/dev/null
+
+          echo "GAMEDIR=$GAMEDIR" > probe_stdout.txt
+          uname -a >> probe_stdout.txt 2>&1
+          if [ ! -f libs/libdoodle-everything.so ] || [ ! -f libs/libc++_shared.so ]; then
+            echo "libs/libdoodle-everything.so dan libs/libc++_shared.so belum ada di $GAMEDIR/libs" > probe_report.txt
             sleep 3
             exit 1
           fi
-          "$SELF/elfdry64" "$GAMEDIR/libs/libdoodle-everything.so" "$GAMEDIR/libs/libc++_shared.so" \
-            > "$GAMEDIR/m2_report.txt" 2>&1
-          rc=$?
-          echo "exit code: $rc" >> "$GAMEDIR/m2_stdout.txt"
-          cat "$GAMEDIR/m2_report.txt" >> "$GAMEDIR/m2_stdout.txt"
+
+          ./elfprobe64 libs/libdoodle-everything.so libs/libc++_shared.so probe_report.txt >> probe_stdout.txt 2>&1
+          echo "exit code: $?" >> probe_stdout.txt
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
-          exit "$rc"
-          EOF_SH
-          chmod +x out/DoodleM2.sh
-          echo "Copy private APK libs here: libdoodle-everything.so and libc++_shared.so. Do not commit these files." > out/doodle_god/libs/KEEP_PRIVATE_LIBS_HERE.txt
+          EOF_SH1
+          cat > out/DoodleLoader.sh <<'EOF_SH2'
+          #!/bin/bash
+          # Doodle God HD loader (Milestone 2, arm64). Argumen dibaca dari loader.args, mis: --stage 0 --timeout 60
+          # Folder data dicari seperti launcher PortMaster lain: /$directory/ports/<nama>
 
-      - name: Compile for Linux AArch64
-        shell: bash
-        run: |
-          set -eu
-          aarch64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -o out/elfdry64 src/elfdry64.c
-          file out/elfdry64
-          aarch64-linux-gnu-readelf -d out/elfdry64 | grep NEEDED
-          MAXV=$(aarch64-linux-gnu-readelf -V out/elfdry64 | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
-          echo "elfdry64 highest GLIBC requirement: ${MAXV:-unknown} (target device: 2.37)"
-          if [ -n "${MAXV:-}" ] && [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
-            echo "ERROR: binary requires glibc newer than 2.37"
+          XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+
+          if [ -d "/opt/system/Tools/PortMaster/" ]; then
+            controlfolder="/opt/system/Tools/PortMaster"
+          elif [ -d "/opt/tools/PortMaster/" ]; then
+            controlfolder="/opt/tools/PortMaster"
+          elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
+            controlfolder="$XDG_DATA_HOME/PortMaster"
+          else
+            controlfolder="/roms/ports/PortMaster"
+          fi
+
+          source $controlfolder/control.txt
+          [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+
+          GAMEDIR="/$directory/ports/doodle_god"
+          [ -d "$GAMEDIR" ] || GAMEDIR="$(cd "$(dirname "$0")" && pwd)/doodle_god"
+
+          cd "$GAMEDIR" || {
+            echo "folder doodle_god tidak ketemu. Dicari di: /$directory/ports/doodle_god dan di sebelah script ini." > "$(dirname "$0")/loader_error.txt"
+            exit 1
+          }
+
+          chmod +x ./doodleloader 2>/dev/null
+
+          if [ ! -f libs/libdoodle-everything.so ] || [ ! -f libs/libc++_shared.so ] || [ ! -f ./doodleloader ]; then
+            echo "libs/libdoodle-everything.so, libs/libc++_shared.so atau doodleloader belum ada di $GAMEDIR" > loader_stdout.txt
+            sleep 3
             exit 1
           fi
 
-      - name: Upload M2 artifact
+          export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
+          # hapus log lama supaya tidak tertukar dengan hasil run ini
+          rm -f loader_log.txt
+          LOADER_ARGS="$(cat loader.args 2>/dev/null)"
+          echo "GAMEDIR=$GAMEDIR  args=$LOADER_ARGS" > loader_stdout.txt
+          [ -f doodlegod.apk ] || echo "(info) doodlegod.apk belum ada di $GAMEDIR: belum dibutuhkan sampai M3" >> loader_stdout.txt
+          ./doodleloader libs $LOADER_ARGS >> loader_stdout.txt 2>&1
+          echo "exit code: $?" >> loader_stdout.txt
+          sleep 2
+          type pm_finish >/dev/null 2>&1 && pm_finish
+          EOF_SH2
+          echo "--stage 0 --timeout 60" > out/doodle_god/loader.args
+          echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
+
+      - name: Kompilasi (aarch64)
+        run: |
+          (cd src && python3 gen_stubs.py)
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o out/doodle_god/elfprobe64 src/elfprobe64.c -ldl
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Isrc -o out/doodle_god/doodleloader src/doodleloader.c -ldl -lpthread -lm
+          file out/doodle_god/elfprobe64 out/doodle_god/doodleloader || true
+          for B in elfprobe64 doodleloader; do
+            echo "--- $B: library yang dibutuhkan:"
+            aarch64-linux-gnu-readelf -d out/doodle_god/$B | grep NEEDED
+            MAXV=$(aarch64-linux-gnu-readelf -V out/doodle_god/$B | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+            echo "$B butuh GLIBC tertinggi: $MAXV (device: 2.37 atau lebih baru)"
+            if [ "$(printf '%s\n%s\n' 2.37 "$MAXV" | sort -V | tail -1)" != "2.37" ]; then
+              echo "GAGAL: $B butuh glibc lebih baru dari 2.37. Simbol penyebab:"
+              aarch64-linux-gnu-nm -D --undefined-only out/doodle_god/$B | grep -E 'GLIBC_2\.(3[89]|[4-9][0-9])'
+              exit 1
+            fi
+          done
+
+      - name: Unggah hasil build
         uses: actions/upload-artifact@v4
         with:
-          name: doodle-m2-dry-arm64
-          path: out/
+          name: doodle-probe-arm64
+          path: out
