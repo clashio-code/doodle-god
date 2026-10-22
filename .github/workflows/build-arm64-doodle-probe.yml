@@ -370,7 +370,7 @@ jobs:
           }
           EOF_C1
           cat > src/doodleloader.c <<'EOF_C2'
-          /* doodleloader - Milestone 3.5 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
+          /* doodleloader - Milestone 3.8 port Doodle God HD (arm64-v8a -> Linux aarch64 / muOS).
            * Memuat libc++_shared.so + libdoodle-everything.so (ELF64 AArch64, bionic) SENDIRI tanpa dlopen,
            * memetakan impornya ke shim bionic->glibc, menyediakan JNI palsu, lalu (opsional) menjalankan kode game.
            * Pakai: doodleloader <folder-libs> [--stage N] [--timeout S] [--apk file] [--frames N] [--sc 0|1] [--selftest]
@@ -536,6 +536,64 @@ jobs:
             }
             if (!shown) L("    (tidak ada)\n");
           }
+          #include <dirent.h>
+          #include <sys/syscall.h>
+          extern int prctl(int, ...);
+          static uintptr_t map_end_of(uintptr_t a) {
+            FILE *m = fopen("/proc/self/maps", "r");
+            char ln[512];
+            uintptr_t lo, hi, r = a + 0x1000;
+            if (!m) return r;
+            while (fgets(ln, sizeof ln, m)) {
+              const char *q = ln;
+              lo = 0; hi = 0;
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) lo = lo * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (*q == '-') q++;
+              while ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f')) hi = hi * 16 + (uintptr_t)(*q <= '9' ? *q - '0' : *q - 'a' + 10), q++;
+              if (a >= lo && a < hi) { r = hi; break; }
+            }
+            fclose(m);
+            return r;
+          }
+          /* thread mana yang crash + semua thread + simbol libc/libc++ di stack (frame game sudah dicakup stack_candidates) */
+          static void thread_diag(uintptr_t sp) {
+            char nm[32] = "?", path[96], cm[64];
+            long tid = (long)syscall(SYS_gettid);
+            DIR *d;
+            struct dirent *e;
+            uintptr_t end = map_end_of(sp), a;
+            int shown = 0;
+            prctl(16, nm, 0, 0, 0);
+            if (sp < 0x10000) { L("  [thread] tid=%ld nama=\"%s\" (sp tidak valid)\n", tid, nm); return; }
+            L("  [thread] tid=%ld nama=\"%s\" %s\n", tid, nm, tid == (long)getpid() ? "(thread UTAMA)" : "(BUKAN thread utama)");
+            d = opendir("/proc/self/task");
+            if (d) {
+              L("  [thread] semua thread:");
+              while ((e = readdir(d)) != NULL) {
+                FILE *f;
+                if (e->d_name[0] == '.') continue;
+                snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+                cm[0] = 0;
+                f = fopen(path, "r");
+                if (f) { if (fgets(cm, sizeof cm, f)) { char *nl = strchr(cm, '\n'); if (nl) *nl = 0; } fclose(f); }
+                L(" %s=%s", e->d_name, cm);
+              }
+              L("\n"); closedir(d);
+            }
+            L("  [stack-semua] kata stack yang menunjuk ke simbol (libc, libc++, dll):\n");
+            for (a = sp; a + 8 <= end && a < sp + 0x4000 && shown < 28; a += 8) {
+              uintptr_t v = *(const uintptr_t *)a;
+              Dl_info di;
+              if (v < 0x10000 || (v & 3)) continue;
+              if (dladdr((void *)v, &di) && di.dli_sname && di.dli_saddr && v >= (uintptr_t)di.dli_saddr && v - (uintptr_t)di.dli_saddr < 0x4000) {
+                const char *fn = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+                L("    sp+%ld: %s+0x%lx (%s)\n", (long)(a - sp), di.dli_sname, (unsigned long)(v - (uintptr_t)di.dli_saddr), fn);
+                shown++;
+              }
+            }
+            if (!shown) L("    (tidak ada)\n");
+          }
+
           static volatile int g_in_sig;
           static void on_sig(int sig, siginfo_t *si, void *ctx) {
             ucontext_t *uc = (ucontext_t *)ctx;
@@ -547,6 +605,7 @@ jobs:
           #endif
             L("\n*** SINYAL %d  addr=%p  pc=%p  lr=%p ***\n", sig, si->si_addr, (void *)pc, (void *)lr);
             describe(pc); describe(lr);
+            thread_diag(sp);
             map_of("pc", pc); map_of("lr", lr);
           #if defined(__aarch64__)
             {
@@ -887,6 +946,18 @@ jobs:
             free(px);
           }
 
+          /* ---------- log pthread_create: attr bionic != glibc, jadi selalu pakai attr NULL (stack default 8 MB) ---------- */
+          static int b_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+            uint64_t d = 0;
+            const char *nm = NULL;
+            int i, rc;
+            for (i = 0; i < nmods; i++)
+              if ((uintptr_t)fn >= (uintptr_t)mods[i].base && (uintptr_t)fn < (uintptr_t)mods[i].base + mods[i].span) nm = game_sym(&mods[i], (uintptr_t)fn, &d);
+            rc = pthread_create(t, NULL, fn, arg);
+            L("[thread] pthread_create fn=%p [%s+0x%llx] attr=%p -> rc=%d\n", (void *)(uintptr_t)fn, nm ? nm : "?", (unsigned long long)d, (const void *)a, rc);
+            return rc;
+          }
+
           typedef struct { const char *name; void *addr; } Shim;
           static const Shim shim[] = {
             {"__errno", (void *)b_errno}, {"__android_log_print", (void *)b_android_log_print}, {"__android_log_vprint", (void *)b_android_log_vprint},
@@ -901,7 +972,7 @@ jobs:
             {"AAsset_getBuffer", (void *)b_AAsset_getBuffer}, {"AAsset_getRemainingLength", (void *)b_AAsset_getRemainingLength},
             {"AAsset_getRemainingLength64", (void *)b_AAsset_getRemainingLength},
             {"glViewport", (void *)b_glViewport}, {"glScissor", (void *)b_glScissor},
-            {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D},
+            {"pthread_create", (void *)b_pthread_create}, {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -1256,9 +1327,6 @@ jobs:
           /* loadResource(path, ptr) dari native: diantrekan, dijawab lewat GameService.loadResourceCallback(ptr, byte[], len) oleh pump_resources() */
           static int g_res_sync = 1;     /* Java asli: loadResource memanggil loadResourceCallback SINKRON di dalam panggilan yang sama; --resq 1 = antre */
           static int g_lic_pending;      /* checkLicensing() -> checkLicensingCallback(true) */
-          static int g_splash_pending;   /* showSplash(b) -> beberapa frame kemudian GameActivity.splashIsActive(b): konfirmasi Java yang melepas flag sibuk Splash::update */
-          static int g_splash_val;
-          static int g_splash_delay = 1; /* jeda dalam frame; --splashack -1 = nonaktif */
           static void res_deliver_one(const char *path, int64_t ptr);
           typedef struct { char path[512]; int64_t ptr; } ResReq;
           static ResReq g_resq[128];
@@ -1298,7 +1366,6 @@ jobs:
                 else if (rt == 'I' && !strcmp(m->name, "hashCode") && strstr(m->cls, "Signature")) { sig_init(); r->i = g_sig_hash; }
             }
             if (rt == 'V' && !strcmp(m->name, "checkLicensing")) g_lic_pending = 1;
-            if (rt == 'V' && !strcmp(m->name, "showSplash") && g_splash_delay >= 0) { g_splash_val = a[0].i & 0xff; g_splash_pending = g_splash_delay + 1; }
             if (rt == 'V' && !strcmp(m->name, "loadResource")) {
               if (g_res_sync) res_deliver_one(h2s(a[0].l), a[1].j);
               else if (g_resq_n < 128) { snprintf(g_resq[g_resq_n].path, sizeof g_resq[0].path, "%s", h2s(a[0].l)); g_resq[g_resq_n].ptr = a[1].j; g_resq_n++; }
@@ -1872,15 +1939,138 @@ jobs:
               g_lic_pending = 0;
               if (f) { L("[game] GameService.checkLicensingCallback(true)\n"); ((void (*)(void *, void *, int))f)(g_nenv, mk_handle("com/joybits/doodleeverything/GameService"), 1); }
             }
-            if (g_splash_pending > 0 && --g_splash_pending == 0) {
-              void *f = mod_find(dg, "Java_com_joybits_doodleeverything_GameActivity_splashIsActive");
-              if (f) { L("[game] GameActivity.splashIsActive(%d) (konfirmasi setelah showSplash)\n", g_splash_val); ((void (*)(void *, void *, int))f)(g_nenv, mk_handle("com/joybits/doodleeverything/GameActivity"), g_splash_val); }
-              else L("[game] GameActivity.splashIsActive TIDAK ADA\n");
-            }
           }
 
           /* siklus hidup persis seperti Java: GameService.initGame -> init(GameService, docPath); onResume -> resume(false);
            * OFAndroidView$1.onSurfaceChanged -> surfaceChanged(w,h); onDrawFrame (frame pertama) -> surfaceCreated(IS_NEED_RELOAD) lalu render() */
+          /* ---------- callback manual Java->native dari callbacks.txt (uji coba tanpa build ulang) ----------
+           * Baris: <frame> <nama ekspor tanpa awalan "Java_"> [arg...]   arg = angka (int/bool) atau s:teks (string). Maks 4 arg. Contoh:
+           *   0 com_joybits_doodleeverything_GameActivity_onConsentGathered 1 */
+          typedef struct { int frame, na, done; char name[160]; uint64_t a[4]; char s[4][100]; int str[4]; } CbReq;
+          static CbReq g_cb[32];
+          static int g_ncb;
+          static void cb_load(void) {
+            FILE *f = fopen("callbacks.txt", "r");
+            char ln[500];
+            if (!f) { L("[cb] callbacks.txt tidak ada (tidak ada callback manual)\n"); return; }
+            while (fgets(ln, sizeof ln, f) && g_ncb < 32) {
+              char *sp = NULL, *t = strtok_r(ln, " \t\r\n", &sp);
+              CbReq *c = &g_cb[g_ncb];
+              if (!t || t[0] == '#') continue;
+              memset(c, 0, sizeof *c);
+              c->frame = pint(t);
+              t = strtok_r(NULL, " \t\r\n", &sp);
+              if (!t) continue;
+              snprintf(c->name, sizeof c->name, "%s", t);
+              while ((t = strtok_r(NULL, " \t\r\n", &sp)) != NULL && c->na < 4) {
+                if (t[0] == 's' && t[1] == ':') { snprintf(c->s[c->na], sizeof c->s[0], "%s", t + 2); c->str[c->na] = 1; }
+                else c->a[c->na] = (uint64_t)jparse(t);
+                c->na++;
+              }
+              g_ncb++;
+            }
+            fclose(f);
+            L("[cb] %d callback manual dari callbacks.txt\n", g_ncb);
+          }
+          static void cb_fire(Mod *dg, int frame) {
+            int i, k;
+            for (i = 0; i < g_ncb; i++) {
+              CbReq *c = &g_cb[i];
+              char full[200];
+              uint64_t v[4];
+              void *fn;
+              if (c->done || c->frame != frame) continue;
+              c->done = 1;
+              snprintf(full, sizeof full, "Java_%s", c->name);
+              fn = mod_find(dg, full);
+              if (!fn) { L("[cb] frame %d: %s TIDAK ADA di ekspor\n", frame, full); continue; }
+              for (k = 0; k < 4; k++) v[k] = c->str[k] ? (uint64_t)(uintptr_t)mk_handle(c->s[k]) : c->a[k];
+              L("[cb] frame %d: memanggil %s (%d argumen, a0=%llu a1=%llu)\n", frame, c->name, c->na, (unsigned long long)c->a[0], (unsigned long long)c->a[1]);
+              ((void (*)(void *, void *, uint64_t, uint64_t, uint64_t, uint64_t))fn)(g_nenv, g_ncls, v[0], v[1], v[2], v[3]);
+              L("[cb] %s selesai\n", c->name);
+            }
+          }
+          /* ---------- profiler: sampel stack thread utama SAAT di dalam render() (juga saat menunggu di futex), unwind lewat frame pointer ---------- */
+          #define NSAMP 4096
+          #define SDEPTH 12
+          static uintptr_t g_samp[NSAMP][SDEPTH];
+          static unsigned char g_sampn[NSAMP];
+          static volatile int g_nsamp, g_in_render, g_sampler_run;
+          static pthread_t g_main_th;
+          static void on_prof(int sig, siginfo_t *si, void *ctx) {
+            int n = g_nsamp, d = 0;
+            (void)sig; (void)si; (void)ctx;
+            if (!g_in_render || n >= NSAMP) return;
+          #if defined(__aarch64__)
+            {
+              ucontext_t *uc = (ucontext_t *)ctx;
+              uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc, lr = (uintptr_t)uc->uc_mcontext.regs[30];
+              uintptr_t sp = (uintptr_t)uc->uc_mcontext.sp, fp = (uintptr_t)uc->uc_mcontext.regs[29];
+              g_samp[n][d++] = pc;
+              if (lr) g_samp[n][d++] = lr;
+              while (d < SDEPTH && fp && !(fp & 15) && fp >= sp && fp < sp + 0x40000) {
+                uintptr_t *fr = (uintptr_t *)fp, nfp = fr[0], ra = fr[1];
+                if (ra && ra != g_samp[n][d - 1]) g_samp[n][d++] = ra;
+                if (nfp <= fp) break;
+                fp = nfp;
+              }
+            }
+          #endif
+            g_sampn[n] = (unsigned char)d;
+            g_nsamp = n + 1;
+          }
+          static void *sampler_main(void *x) {
+            struct timespec ts;
+            (void)x;
+            ts.tv_sec = 0; ts.tv_nsec = 300000;
+            while (g_sampler_run) { nanosleep(&ts, NULL); if (g_in_render) pthread_kill(g_main_th, SIGUSR1); }
+            return NULL;
+          }
+          static void sampler_start(void) {
+            struct sigaction sa;
+            pthread_t th;
+            if (access("profile.on", F_OK) != 0) return;   /* profiler opt-in: buat file kosong profile.on */
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+            sigaction(SIGUSR1, &sa, NULL);
+            g_main_th = pthread_self(); g_sampler_run = 1;
+            if (pthread_create(&th, NULL, sampler_main, NULL) != 0) L("[prof] gagal membuat thread sampler\n");
+          }
+          static const char *samp_name(uintptr_t a, char *buf, size_t sz) {
+            int i;
+            Dl_info di;
+            for (i = 0; i < nmods; i++)
+              if (a >= (uintptr_t)mods[i].base && a < (uintptr_t)mods[i].base + mods[i].span) {
+                uint64_t d = 0; const char *nm = game_sym(&mods[i], a, &d);
+                snprintf(buf, sz, "%s", nm ? nm : "?");
+                return buf;
+              }
+            if (dladdr((void *)a, &di) && di.dli_sname) snprintf(buf, sz, "[libc]%s", di.dli_sname);
+            else snprintf(buf, sz, "[?]%p", (void *)a);
+            return buf;
+          }
+          static char g_skey[NSAMP][560];
+          static void sampler_report(void) {
+            int i, j, k, nu = 0, shown = 0;
+            static int ukey[NSAMP], ucnt[NSAMP];
+            if (!g_sampler_run) return;
+            g_sampler_run = 0;
+            L("\n== profiler: %d sampel (stack di dalam render(), frame teratas dulu; nama masih mangled) ==\n", g_nsamp);
+            for (i = 0; i < g_nsamp; i++) {
+              size_t o = 0; char nm[200];
+              g_skey[i][0] = 0;
+              for (k = 0; k < g_sampn[i] && k < 9 && o + 210 < sizeof g_skey[0]; k++) o += (size_t)snprintf(g_skey[i] + o, sizeof g_skey[0] - o, "%s%s", k ? " < " : "", samp_name(g_samp[i][k], nm, sizeof nm));
+              for (j = 0; j < nu; j++) if (!strcmp(g_skey[ukey[j]], g_skey[i])) { ucnt[j]++; break; }
+              if (j == nu) { ukey[nu] = i; ucnt[nu] = 1; nu++; }
+            }
+            while (shown < 15 && shown < nu) {
+              int best = -1;
+              for (j = 0; j < nu; j++) if (ucnt[j] > 0 && (best < 0 || ucnt[j] > ucnt[best])) best = j;
+              if (best < 0) break;
+              L("  %4dx  %s\n", ucnt[best], g_skey[ukey[best]]);
+              ucnt[best] = -ucnt[best]; shown++;
+            }
+          }
           static int run_game(Mod *dg, int frames, int sc) {
             g_dgmod = dg;
             int w = 640, h = 480, f;
@@ -1934,19 +2124,25 @@ jobs:
             L("[game] OFAndroidApp.surfaceCreated(%d)\n", sc);
             nf_surfaceCreated(g_nenv, g_ncls, sc);          L("[game] surfaceCreated selesai\n"); gl_check("surfaceCreated");
 
-            L("[game] mulai loop render (%s)\n", frames > 0 ? "jumlah frame terbatas" : "sampai Select+Start / tutup");
+            cb_load();
+              sampler_start();
+              L("[game] mulai loop render (%s)\n", frames > 0 ? "jumlah frame terbatas" : "sampai Select+Start / tutup");
             t0 = next = now_ns();
             for (f = 0; (frames <= 0 || f < frames) && !g_quit; f++) {
               long long n;
+              cb_fire(dg, f);
               pump_events();
               pump_resources(dg);
+              g_in_render = 1;
               nf_render(g_nenv, g_ncls);
+              g_in_render = 0;
               if (f == 120 || f == 600) screenshot(f);   /* baca back buffer SEBELUM swap */
               p_SDL_GL_SwapWindow(g_win);
               if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u\n", f, g_n_draw, g_n_tex); gl_check("render"); }
               next += step; n = now_ns();
               if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
             }
+            sampler_report();
             L("[game] loop selesai: %d frame dalam %.2f detik | aset dibuka=%d tidak-ada=%d\n", f, (double)(now_ns() - t0) / 1e9, g_asset_ok, g_asset_miss);
             return 0;
           }
@@ -2057,14 +2253,13 @@ jobs:
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
               else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
-              else if (!strcmp(argv[i], "--splashack") && i + 1 < argc) { const char *z = argv[++i]; g_splash_delay = (*z == '-') ? -1 : pint(z); }
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
               else if (!strcmp(argv[i], "--size") && i + 1 < argc) { const char *z = argv[++i]; g_gw = pint(z); while (*z >= '0' && *z <= '9') z++; g_gh = *z == 'x' ? pint(z + 1) : 0; }
               else if (!strcmp(argv[i], "--fit") && i + 1 < argc) g_fit_stretch = !strcmp(argv[++i], "stretch");
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.5-splash) ==\n");
+            L("== doodleloader (Milestone 3.8) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
@@ -2279,6 +2474,7 @@ jobs:
             exit 1
           fi
 
+          export LIBC_FATAL_STDERR_=1   # pesan abort/heap glibc ke stderr -> loader_stdout.txt
           export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
           # hapus log lama supaya tidak tertukar dengan hasil run ini
           rm -f loader_log.txt
@@ -2290,7 +2486,22 @@ jobs:
           sleep 2
           type pm_finish >/dev/null 2>&1 && pm_finish
           EOF_SH2
-          echo "--stage 3 --frames 700 --timeout 120 --sc 1" > out/doodle_god/loader.args
+          echo "--stage 3 --frames 1500 --timeout 120 --sc 1" > out/doodle_god/loader.args
+          cat > out/doodle_god/callbacks.txt <<'EOF_CB'
+          # Callback manual Java->native. Format: <frame> <nama ekspor tanpa awalan Java_> [arg...]   (arg: angka, atau s:teks untuk string, maks 4)
+          # Nama diambil dari daftar "ekspor Java_*" di loader_log.txt. Jalan sebelum render frame tsb. Edit file ini tanpa build ulang.
+          # splashIsActive(true) setelah showSplash = pemicu yang membuat game lanjut loading (terbukti: draw/loadResource baru muncul)
+          2 com_joybits_doodleeverything_GameActivity_splashIsActive 1
+          #0 com_joybits_doodleeverything_GameActivity_onConsentGathered 1   (tidak berpengaruh)
+          # kandidat lain untuk dicoba (hapus tanda # satu per satu):
+          #3 com_joybits_doodleeverything_GameActivity_onHideLogo
+          #3 com_joybits_doodleeverything_GameService_pixtelInitCallback 1
+          #3 com_joybits_doodleeverything_GameService_onRemoteConfigUpdateCallback s:{}
+          #3 com_joybits_doodleeverything_GameService_onAbTestConfigUpdateCallback s:{}
+          EOF_CB
+          cat > out/doodle_god/java_values.txt <<'EOF_JV'
+          isAnalyticsProvidersReady=1
+          EOF_JV
           echo "Taruh libdoodle-everything.so dan libc++_shared.so dari lib/arm64-v8a di APK Doodle God ke folder ini. Jangan di-upload ke GitHub." > out/doodle_god/libs/TARUH-LIB-DI-SINI.txt
 
       - name: Kompilasi (aarch64)
