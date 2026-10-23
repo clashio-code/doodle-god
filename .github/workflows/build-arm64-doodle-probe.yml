@@ -1483,20 +1483,9 @@ jobs:
             au_mus_next(m, m->f1); m->phase = 1.0;
           }
 
-          static unsigned au_cb_n; static double au_gap_max_ms, au_prev_ms; static unsigned au_late;
-          static float au_soft(float x) {   /* pembatas lembut: lolos linear sampai 24000, lalu melengkung mendekati 32767 (tanpa 'pecah' akibat clipping keras) */
-            float a = x < 0.f ? -x : x, t, y;
-            if (a <= 24000.f) return x;
-            t = (a - 24000.f) / 12000.f; y = 24000.f + 8767.f * (t / (1.f + t));
-            return x < 0.f ? -y : y;
-          }
           static void au_callback(void *ud, uint8_t *stream, int len) {
             int16_t *o = (int16_t *)stream; int frames = len / 4, i, v, k;
-            struct timespec ts_; double now_ms;
             (void)ud;
-            clock_gettime(CLOCK_MONOTONIC, &ts_); now_ms = (double)ts_.tv_sec * 1000.0 + (double)ts_.tv_nsec / 1e6;
-            if (au_prev_ms > 0.0) { double gap = now_ms - au_prev_ms; if (gap > au_gap_max_ms) au_gap_max_ms = gap; if (gap > (double)frames * 1000.0 / AU_RATE * 1.8) au_late++; }
-            au_prev_ms = now_ms; au_cb_n++;
             for (i = 0; i < frames; i++) {
               int32_t l = 0, r = 0;
               for (v = 0; v < AU_MAXVOX; v++) {
@@ -1505,7 +1494,7 @@ jobs:
                 {
                   AuSnd *s = &au_snd[x->snd];
                   if (x->pos >= s->n) { if (x->loop && s->n > 0) x->pos = 0; else { x->active = 0; continue; } }
-                  l += (int32_t)(s->pcm[x->pos * 2] * s->vol * 0.8f); r += (int32_t)(s->pcm[x->pos * 2 + 1] * s->vol * 0.8f); x->pos++;
+                  l += (int32_t)(s->pcm[x->pos * 2] * s->vol); r += (int32_t)(s->pcm[x->pos * 2 + 1] * s->vol); x->pos++;
                 }
               }
               for (k = 0; k < au_nmus; k++) {
@@ -1525,14 +1514,11 @@ jobs:
                   if (au_done_n < 16) au_done_q[au_done_n++] = m->ptr;
                 }
               }
-              {
-                float fl = au_soft((float)l), fr = au_soft((float)r);
-                if (fl > 32767.f) fl = 32767.f;
-                if (fl < -32768.f) fl = -32768.f;
-                if (fr > 32767.f) fr = 32767.f;
-                if (fr < -32768.f) fr = -32768.f;
-                o[i * 2] = (int16_t)fl; o[i * 2 + 1] = (int16_t)fr;
-              }
+              if (l > 32767) l = 32767;
+              if (l < -32768) l = -32768;
+              if (r > 32767) r = 32767;
+              if (r < -32768) r = -32768;
+              o[i * 2] = (int16_t)l; o[i * 2 + 1] = (int16_t)r;
             }
           }
 
@@ -1556,7 +1542,7 @@ jobs:
             if (!initsub || !p_SDL_OpenAudioDevice_ || !p_SDL_PauseAudioDevice_ || !p_SDL_LockAudioDevice_ || !p_SDL_UnlockAudioDevice_) { L("[audio] simbol SDL audio kurang\n"); return 0; }
             if (initsub(0x10u) != 0) { L("[audio] SDL_InitSubSystem(AUDIO) gagal\n"); return 0; }
             memset(&want, 0, sizeof want); memset(&have, 0, sizeof have);
-            want.freq = AU_RATE; want.format = 0x8010; want.channels = 2; want.samples = 2048; want.callback = au_callback;
+            want.freq = AU_RATE; want.format = 0x8010; want.channels = 2; want.samples = 1024; want.callback = au_callback;
             au_dev = (uint32_t)p_SDL_OpenAudioDevice_(NULL, 0, &want, &have, 0);
             if (au_dev == 0) { L("[audio] SDL_OpenAudioDevice gagal\n"); return 0; }
             L("[audio] perangkat audio OK: want %d Hz s16 stereo, have %d Hz fmt=0x%x ch=%d samples=%d\n", want.freq, have.freq, have.format, have.channels, have.samples);
@@ -2391,8 +2377,6 @@ jobs:
             return v;
           }
           static void mem_log(int f, long long *last_ns, int *last_f) {
-            L("[audio] callback=%u kali, jeda terpanjang=%.0f ms (normal ~%.0f ms), terlambat=%u kali\n", au_cb_n, au_gap_max_ms, 2048.0 * 1000.0 / AU_RATE, au_late);
-            au_gap_max_ms = 0.0;
             long long t = now_ns();
             double ms = (*last_f >= 0 && f > *last_f) ? (double)(t - *last_ns) / 1e6 / (double)(f - *last_f) : 0.0;
             L("[mem] frame %d: RSS=%ld MB  puncak=%ld MB  | sistem: tersedia=%ld MB dari %ld MB | %.1f ms/frame (%.1f fps)\n", f,
@@ -2591,7 +2575,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.14-audio2) ==\n");
+            L("== doodleloader (Milestone 3.13-safebt) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
