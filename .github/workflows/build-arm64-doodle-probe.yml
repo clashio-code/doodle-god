@@ -835,6 +835,8 @@ jobs:
           static int g_texdiv = 2;
           static unsigned g_unit; static unsigned g_bound[8]; static unsigned char g_tscaled[65536];
           static int g_ualign = 4;
+          static int g_tw[65536], g_th[65536]; static unsigned g_tfmt[65536], g_tty[65536];
+          static unsigned g_tex_alloc, g_tex_fbo, g_tex_comp, g_tex_sub, g_tex_log;
           static unsigned g_tex_red, g_tex_skip; static double g_tex_saved_mb;
           static void (*r_glBindTexture)(unsigned, unsigned);
           static void (*r_glActiveTexture)(unsigned);
@@ -871,28 +873,63 @@ jobs:
             int sc = 0;
             g_n_tex++;
             GLR(glTexImage2D); GLR(glPixelStorei);
+            if (g_tex_log < 40 && w >= 64 && h >= 64) { g_tex_log++; L("[tex] glTexImage2D id=%u lv=%d %dx%d ifmt=0x%x fmt=0x%x ty=0x%x px=%s\n", id, lv, w, h, (unsigned)ifmt, fmt, ty, px ? "ada" : "NULL"); }
             if (tg == 0x0DE1u && lv > 0 && id < 65536u && g_tscaled[id]) return;   /* mip eksplisit untuk tekstur yang sudah diperkecil: dibuang */
-            if (g_texdiv > 1 && tg == 0x0DE1u && lv == 0 && px && ty == 0x1401u && (unsigned)ifmt == fmt && (fmt == 0x1908u || fmt == 0x1907u) &&
-                w >= 128 && h >= 128 && w / g_texdiv >= 1 && r_glPixelStorei && r_glTexImage2D) {
-              int bpp = fmt == 0x1908u ? 4 : 3, w2 = 0, h2 = 0;
-              unsigned char *sm = tex_shrink((const unsigned char *)px, w, h, bpp, g_ualign < 1 ? 1 : g_ualign, g_texdiv, &w2, &h2);
-              if (sm) {
-                int old = g_ualign;
-                r_glPixelStorei(0x0CF5u, 1);
-                r_glTexImage2D(tg, lv, ifmt, w2, h2, b, fmt, ty, sm);
-                r_glPixelStorei(0x0CF5u, old);
-                free(sm);
+            if (g_texdiv > 1 && tg == 0x0DE1u && lv == 0 && ty == 0x1401u && (unsigned)ifmt == fmt && (fmt == 0x1908u || fmt == 0x1907u) &&
+                w >= 128 && h >= 128 && w / g_texdiv >= 1 && h / g_texdiv >= 1 && id < 65536u && r_glPixelStorei && r_glTexImage2D) {
+              int bpp = fmt == 0x1908u ? 4 : 3, w2 = w / g_texdiv, h2 = h / g_texdiv;
+              if (px) {
+                unsigned char *sm = tex_shrink((const unsigned char *)px, w, h, bpp, g_ualign < 1 ? 1 : g_ualign, g_texdiv, &w2, &h2);
+                if (sm) {
+                  int old = g_ualign;
+                  r_glPixelStorei(0x0CF5u, 1);
+                  r_glTexImage2D(tg, lv, ifmt, w2, h2, b, fmt, ty, sm);
+                  r_glPixelStorei(0x0CF5u, old);
+                  free(sm);
+                  sc = 1;
+                }
+              } else {   /* ofTexture::allocate: alokasi kosong lalu glTexSubImage2D -> alokasikan versi kecil */
+                r_glTexImage2D(tg, lv, ifmt, w2, h2, b, fmt, ty, NULL);
+                g_tex_alloc++; sc = 1;
+              }
+              if (sc) {
+                g_tw[id] = w; g_th[id] = h; g_tfmt[id] = fmt; g_tty[id] = ty;
                 g_tex_red++; g_tex_saved_mb += ((double)w * h - (double)w2 * h2) * bpp / 1048576.0;
-                if (g_tex_red <= 12) L("[texdiv] id=%u %dx%d -> %dx%d (%s)\n", id, w, h, w2, h2, bpp == 4 ? "RGBA" : "RGB");
-                sc = 1;
+                if (g_tex_red <= 12) L("[texdiv] id=%u %dx%d -> %dx%d (%s, %s)\n", id, w, h, w2, h2, bpp == 4 ? "RGBA" : "RGB", px ? "dengan data" : "alokasi kosong");
               }
             }
-            if (!sc) { if (px && lv == 0) g_tex_skip++; if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px); }
+            if (!sc) { if (lv == 0) g_tex_skip++; if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px); }
             if (tg == 0x0DE1u && lv == 0 && id < 65536u) g_tscaled[id] = (unsigned char)sc;
+          }
+          /* tekstur yang dipakai sebagai target render (FBO) harus ukuran penuh: kalau sudah diperkecil, alokasikan ulang penuh */
+          static void tex_unshrink(unsigned tex) {
+            unsigned save;
+            if (tex == 0 || tex >= 65536u || !g_tscaled[tex] || !r_glTexImage2D || !r_glBindTexture) return;
+            save = g_bound[g_unit & 7];
+            r_glBindTexture(0x0DE1u, tex);
+            r_glTexImage2D(0x0DE1u, 0, (int)g_tfmt[tex], g_tw[tex], g_th[tex], 0, g_tfmt[tex], g_tty[tex], NULL);
+            r_glBindTexture(0x0DE1u, save);
+            g_tscaled[tex] = 0; g_tex_fbo++;
+            L("[texdiv] id=%u dipakai sebagai target FBO -> dikembalikan ke %dx%d\n", tex, g_tw[tex], g_th[tex]);
+          }
+          static void (*r_glFramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+          static void (*r_glFramebufferTexture2DOES)(unsigned, unsigned, unsigned, unsigned, int);
+          static void b_glFramebufferTexture2D(unsigned t, unsigned a, unsigned tt, unsigned tex, int lv) { GLR(glFramebufferTexture2D); GLR(glBindTexture); GLR(glTexImage2D); tex_unshrink(tex); if (r_glFramebufferTexture2D) r_glFramebufferTexture2D(t, a, tt, tex, lv); }
+          static void b_glFramebufferTexture2DOES(unsigned t, unsigned a, unsigned tt, unsigned tex, int lv) { GLR(glFramebufferTexture2DOES); GLR(glBindTexture); GLR(glTexImage2D); tex_unshrink(tex); if (r_glFramebufferTexture2DOES) r_glFramebufferTexture2DOES(t, a, tt, tex, lv); }
+          static void (*r_glCompressedTexImage2D)(unsigned, int, unsigned, int, int, int, int, const void *);
+          static void b_glCompressedTexImage2D(unsigned tg, int lv, unsigned ifmt, int w, int h, int b, int sz, const void *px) {
+            unsigned id = g_bound[g_unit & 7];
+            GLR(glCompressedTexImage2D);
+            g_tex_comp++;
+            if (g_tex_comp <= 8) L("[tex] glCompressedTexImage2D id=%u lv=%d %dx%d ifmt=0x%x size=%d\n", id, lv, w, h, ifmt, sz);
+            if (tg == 0x0DE1u && lv == 0 && id < 65536u) g_tscaled[id] = 0;
+            if (r_glCompressedTexImage2D) r_glCompressedTexImage2D(tg, lv, ifmt, w, h, b, sz, px);
           }
           static void b_glTexSubImage2D(unsigned tg, int lv, int xo, int yo, int w, int h, unsigned fmt, unsigned ty, const void *px) {
             unsigned id = g_bound[g_unit & 7];
             GLR(glTexSubImage2D); GLR(glPixelStorei);
+            g_tex_sub++;
+            if (g_tex_sub <= 6) L("[tex] glTexSubImage2D id=%u lv=%d off=(%d,%d) %dx%d fmt=0x%x ty=0x%x scaled=%d\n", id, lv, xo, yo, w, h, fmt, ty, id < 65536u ? g_tscaled[id] : -1);
             if (tg == 0x0DE1u && id < 65536u && g_tscaled[id]) {
               int bpp = fmt == 0x1908u ? 4 : fmt == 0x1907u ? 3 : 0, w2 = 0, h2 = 0;
               if (lv > 0) return;
@@ -991,6 +1028,7 @@ jobs:
             {"glViewport", (void *)b_glViewport}, {"glScissor", (void *)b_glScissor},
             {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D}, {"glTexSubImage2D", (void *)b_glTexSubImage2D}, {"glBindTexture", (void *)b_glBindTexture},
             {"glActiveTexture", (void *)b_glActiveTexture}, {"glPixelStorei", (void *)b_glPixelStorei}, {"glDeleteTextures", (void *)b_glDeleteTextures},
+            {"glFramebufferTexture2D", (void *)b_glFramebufferTexture2D}, {"glFramebufferTexture2DOES", (void *)b_glFramebufferTexture2DOES}, {"glCompressedTexImage2D", (void *)b_glCompressedTexImage2D},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -2411,7 +2449,7 @@ jobs:
               cursor_draw();   /* tepat sebelum screenshot + swap */
               if (f == 120 || f == 600) screenshot(f);   /* baca back buffer SEBELUM swap */
               p_SDL_GL_SwapWindow(g_win);
-              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u | texdiv=%d: %u diperkecil (hemat ~%.0f MB), %u utuh\n", f, g_n_draw, g_n_tex, g_texdiv, g_tex_red, g_tex_saved_mb, g_tex_skip); gl_check("render"); }
+              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u | texdiv=%d: %u diperkecil (hemat ~%.0f MB; %u alokasi kosong, %u dikembalikan utk FBO), %u utuh, %u terkompresi, %u subimage\n", f, g_n_draw, g_n_tex, g_texdiv, g_tex_red, g_tex_saved_mb, g_tex_alloc, g_tex_fbo, g_tex_skip, g_tex_comp, g_tex_sub); gl_check("render"); }
               if ((f % 120) == 0) mem_log(f, &mem_t, &mem_f);
               next += step; n = now_ns();
               if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
@@ -2536,7 +2574,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.11-texdiv) ==\n");
+            L("== doodleloader (Milestone 3.12-texdiv2) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
