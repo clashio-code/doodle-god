@@ -547,7 +547,21 @@ jobs:
           #endif
             L("\n*** SINYAL %d  addr=%p  pc=%p  lr=%p ***\n", sig, si->si_addr, (void *)pc, (void *)lr);
             describe(pc); describe(lr);
-            map_of("pc", pc); map_of("lr", lr);
+          #if defined(__aarch64__)
+              {   /* backtrace lewat rantai frame-pointer (x29): tiap frame = {fp_sebelumnya, return_address} */
+                uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+                int n;
+                L("  [bt] (aman, tanpa malloc) rantai frame-pointer dari x29=%p:\n", (void *)fp);
+                for (n = 0; n < 32 && fp && !(fp & 7) && fp >= sp - 4096 && fp < sp + 0x400000; n++) {
+                  const uintptr_t *fr = (const uintptr_t *)fp;
+                  uintptr_t ra = fr[1], nfp = fr[0];
+                  L("   #%d ra=%p\n", n, (void *)ra);
+                  describe(ra);
+                  if (nfp <= fp) break;
+                  fp = nfp;
+                }
+              }
+          #endif
           #if defined(__aarch64__)
             {
               int k;
@@ -562,22 +576,9 @@ jobs:
                 L("\n");
               }
               stack_candidates(sp, 24576, 80, "");
-              {   /* backtrace lewat rantai frame-pointer (x29): tiap frame = {fp_sebelumnya, return_address} */
-                uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
-                int n;
-                L("  [bt] rantai frame-pointer dari x29=%p:\n", (void *)fp);
-                for (n = 0; n < 32 && fp && !(fp & 7) && fp >= sp - 4096 && fp < sp + 0x400000; n++) {
-                  const uintptr_t *fr = (const uintptr_t *)fp;
-                  uintptr_t ra = fr[1], nfp = fr[0];
-                  L("   #%d ra=%p\n", n, (void *)ra);
-                  describe(ra);
-                  if (n < 8) map_of("ra", ra);
-                  if (nfp <= fp) break;
-                  fp = nfp;
-                }
-              }
             }
           #endif
+            map_of("pc", pc); map_of("lr", lr);
             _exit(128 + sig);
           }
           static void on_alarm(int sig) { (void)sig; L("\n*** WATCHDOG: waktu habis, proses dihentikan ***\n"); _exit(4); }
@@ -2574,7 +2575,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.12-texdiv2) ==\n");
+            L("== doodleloader (Milestone 3.13-safebt) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
