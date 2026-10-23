@@ -562,6 +562,20 @@ jobs:
                 L("\n");
               }
               stack_candidates(sp, 24576, 80, "");
+              {   /* backtrace lewat rantai frame-pointer (x29): tiap frame = {fp_sebelumnya, return_address} */
+                uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+                int n;
+                L("  [bt] rantai frame-pointer dari x29=%p:\n", (void *)fp);
+                for (n = 0; n < 32 && fp && !(fp & 7) && fp >= sp - 4096 && fp < sp + 0x400000; n++) {
+                  const uintptr_t *fr = (const uintptr_t *)fp;
+                  uintptr_t ra = fr[1], nfp = fr[0];
+                  L("   #%d ra=%p\n", n, (void *)ra);
+                  describe(ra);
+                  if (n < 8) map_of("ra", ra);
+                  if (nfp <= fp) break;
+                  fp = nfp;
+                }
+              }
             }
           #endif
             _exit(128 + sig);
@@ -817,10 +831,84 @@ jobs:
             if (!r_glDrawElements) *(void **)&r_glDrawElements = h_gles ? dlsym(h_gles, "glDrawElements") : NULL;
             if (r_glDrawElements) r_glDrawElements(m, c, t, i);
           }
+          /* ---------- kompres tekstur: aset game 1366x768, layar cuma 640x480 -> unggah tekstur besar diperkecil (--texdiv N, 1 = mati) ---------- */
+          static int g_texdiv = 2;
+          static unsigned g_unit; static unsigned g_bound[8]; static unsigned char g_tscaled[65536];
+          static int g_ualign = 4;
+          static unsigned g_tex_red, g_tex_skip; static double g_tex_saved_mb;
+          static void (*r_glBindTexture)(unsigned, unsigned);
+          static void (*r_glActiveTexture)(unsigned);
+          static void (*r_glPixelStorei)(unsigned, int);
+          static void (*r_glTexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+          static void (*r_glDeleteTextures)(int, const unsigned *);
+          #define GLR(fn) do { if (!r_##fn) *(void **)&r_##fn = h_gles ? dlsym(h_gles, #fn) : NULL; } while (0)
+          static void b_glBindTexture(unsigned tg, unsigned id) { GLR(glBindTexture); if (tg == 0x0DE1u) g_bound[g_unit & 7] = id; if (r_glBindTexture) r_glBindTexture(tg, id); }
+          static void b_glActiveTexture(unsigned u) { GLR(glActiveTexture); g_unit = u - 0x84C0u; if (r_glActiveTexture) r_glActiveTexture(u); }
+          static void b_glPixelStorei(unsigned pn, int v) { GLR(glPixelStorei); if (pn == 0x0CF5u) g_ualign = v; if (r_glPixelStorei) r_glPixelStorei(pn, v); }
+          static void b_glDeleteTextures(int n, const unsigned *ids) {
+            int i;
+            GLR(glDeleteTextures);
+            for (i = 0; i < n; i++) if (ids[i] < 65536u) g_tscaled[ids[i]] = 0;
+            if (r_glDeleteTextures) r_glDeleteTextures(n, ids);
+          }
+          /* kotak rata-rata div x div; src baris berjarak 'stride' byte, bpp byte/piksel; hasil rapat (tanpa padding) */
+          static unsigned char *tex_shrink(const unsigned char *src, int w, int h, int bpp, int align, int div, int *ow, int *oh) {
+            int w2 = w / div, h2 = h / div, x, y, c, dx, dy; size_t stride = (((size_t)w * (size_t)bpp + (size_t)align - 1) / (size_t)align) * (size_t)align;
+            unsigned char *o;
+            if (w2 < 1 || h2 < 1) return NULL;
+            o = malloc((size_t)w2 * (size_t)h2 * (size_t)bpp);
+            if (!o) return NULL;
+            for (y = 0; y < h2; y++) for (x = 0; x < w2; x++) for (c = 0; c < bpp; c++) {
+              unsigned sum = 0;
+              for (dy = 0; dy < div; dy++) for (dx = 0; dx < div; dx++) sum += src[(size_t)(y * div + dy) * stride + (size_t)((x * div + dx) * bpp + c)];
+              o[((size_t)y * (size_t)w2 + (size_t)x) * (size_t)bpp + (size_t)c] = (unsigned char)(sum / (unsigned)(div * div));
+            }
+            *ow = w2; *oh = h2;
+            return o;
+          }
           static void b_glTexImage2D(unsigned tg, int lv, int ifmt, int w, int h, int b, unsigned fmt, unsigned ty, const void *px) {
+            unsigned id = g_bound[g_unit & 7];
+            int sc = 0;
             g_n_tex++;
-            if (!r_glTexImage2D) *(void **)&r_glTexImage2D = h_gles ? dlsym(h_gles, "glTexImage2D") : NULL;
-            if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px);
+            GLR(glTexImage2D); GLR(glPixelStorei);
+            if (tg == 0x0DE1u && lv > 0 && id < 65536u && g_tscaled[id]) return;   /* mip eksplisit untuk tekstur yang sudah diperkecil: dibuang */
+            if (g_texdiv > 1 && tg == 0x0DE1u && lv == 0 && px && ty == 0x1401u && (unsigned)ifmt == fmt && (fmt == 0x1908u || fmt == 0x1907u) &&
+                w >= 128 && h >= 128 && w / g_texdiv >= 1 && r_glPixelStorei && r_glTexImage2D) {
+              int bpp = fmt == 0x1908u ? 4 : 3, w2 = 0, h2 = 0;
+              unsigned char *sm = tex_shrink((const unsigned char *)px, w, h, bpp, g_ualign < 1 ? 1 : g_ualign, g_texdiv, &w2, &h2);
+              if (sm) {
+                int old = g_ualign;
+                r_glPixelStorei(0x0CF5u, 1);
+                r_glTexImage2D(tg, lv, ifmt, w2, h2, b, fmt, ty, sm);
+                r_glPixelStorei(0x0CF5u, old);
+                free(sm);
+                g_tex_red++; g_tex_saved_mb += ((double)w * h - (double)w2 * h2) * bpp / 1048576.0;
+                if (g_tex_red <= 12) L("[texdiv] id=%u %dx%d -> %dx%d (%s)\n", id, w, h, w2, h2, bpp == 4 ? "RGBA" : "RGB");
+                sc = 1;
+              }
+            }
+            if (!sc) { if (px && lv == 0) g_tex_skip++; if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px); }
+            if (tg == 0x0DE1u && lv == 0 && id < 65536u) g_tscaled[id] = (unsigned char)sc;
+          }
+          static void b_glTexSubImage2D(unsigned tg, int lv, int xo, int yo, int w, int h, unsigned fmt, unsigned ty, const void *px) {
+            unsigned id = g_bound[g_unit & 7];
+            GLR(glTexSubImage2D); GLR(glPixelStorei);
+            if (tg == 0x0DE1u && id < 65536u && g_tscaled[id]) {
+              int bpp = fmt == 0x1908u ? 4 : fmt == 0x1907u ? 3 : 0, w2 = 0, h2 = 0;
+              if (lv > 0) return;
+              if (bpp && ty == 0x1401u && px && r_glPixelStorei && r_glTexSubImage2D && w >= g_texdiv && h >= g_texdiv) {
+                unsigned char *sm = tex_shrink((const unsigned char *)px, w, h, bpp, g_ualign < 1 ? 1 : g_ualign, g_texdiv, &w2, &h2);
+                if (sm) {
+                  int old = g_ualign;
+                  r_glPixelStorei(0x0CF5u, 1);
+                  r_glTexSubImage2D(tg, lv, xo / g_texdiv, yo / g_texdiv, w2, h2, fmt, ty, sm);
+                  r_glPixelStorei(0x0CF5u, old);
+                  free(sm);
+                }
+              }
+              return;
+            }
+            if (r_glTexSubImage2D) r_glTexSubImage2D(tg, lv, xo, yo, w, h, fmt, ty, px);
           }
           static unsigned png_crc(unsigned c, const unsigned char *p, size_t n) {
             static unsigned tab[256];
@@ -901,7 +989,8 @@ jobs:
             {"AAsset_getBuffer", (void *)b_AAsset_getBuffer}, {"AAsset_getRemainingLength", (void *)b_AAsset_getRemainingLength},
             {"AAsset_getRemainingLength64", (void *)b_AAsset_getRemainingLength},
             {"glViewport", (void *)b_glViewport}, {"glScissor", (void *)b_glScissor},
-            {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D},
+            {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D}, {"glTexSubImage2D", (void *)b_glTexSubImage2D}, {"glBindTexture", (void *)b_glBindTexture},
+            {"glActiveTexture", (void *)b_glActiveTexture}, {"glPixelStorei", (void *)b_glPixelStorei}, {"glDeleteTextures", (void *)b_glDeleteTextures},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -2322,7 +2411,7 @@ jobs:
               cursor_draw();   /* tepat sebelum screenshot + swap */
               if (f == 120 || f == 600) screenshot(f);   /* baca back buffer SEBELUM swap */
               p_SDL_GL_SwapWindow(g_win);
-              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u\n", f, g_n_draw, g_n_tex); gl_check("render"); }
+              if (f < 3 || (f % 120) == 0) { L("[game] frame %d selesai | gl kumulatif: draw=%u tekstur=%u | texdiv=%d: %u diperkecil (hemat ~%.0f MB), %u utuh\n", f, g_n_draw, g_n_tex, g_texdiv, g_tex_red, g_tex_saved_mb, g_tex_skip); gl_check("render"); }
               if ((f % 120) == 0) mem_log(f, &mem_t, &mem_f);
               next += step; n = now_ns();
               if (next > n) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(next - n); nanosleep(&ts, NULL); } else next = n;
@@ -2437,6 +2526,7 @@ jobs:
               else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = pint(argv[++i]);
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
               else if (!strcmp(argv[i], "--audio") && i + 1 < argc) g_audio = pint(argv[++i]) != 0;
+              else if (!strcmp(argv[i], "--texdiv") && i + 1 < argc) { g_texdiv = pint(argv[++i]); if (g_texdiv < 1) g_texdiv = 1; if (g_texdiv > 4) g_texdiv = 4; }
               else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
               else if (!strcmp(argv[i], "--splashack") && i + 1 < argc) { const char *z = argv[++i]; g_splash_delay = (*z == '-') ? -1 : pint(z); }
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
@@ -2446,7 +2536,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.9-mem) ==\n");
+            L("== doodleloader (Milestone 3.11-texdiv) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
