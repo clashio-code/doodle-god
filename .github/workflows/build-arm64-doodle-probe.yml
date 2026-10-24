@@ -878,6 +878,9 @@ jobs:
           }
           /* ---------- kompres tekstur: aset game 1366x768, layar cuma 640x480 -> unggah tekstur besar diperkecil (--texdiv N, 1 = mati) ---------- */
           static int g_texdiv = 2;
+          static char g_last_res[200];                 /* path aset terakhir yang dikirim ke game (sumber tekstur yang diunggah sesudahnya) */
+          static char g_texskip[8][48]; static int g_ntexskip;   /* --texskip a,b,c : jangan perkecil tekstur yang sumbernya mengandung salah satu kata */
+          static char g_tpath[4096][72]; static unsigned g_texsrc_log;
           static unsigned g_unit; static unsigned g_bound[8]; static unsigned char g_tscaled[65536];
           static int g_ualign = 4;
           static int g_tw[65536], g_th[65536]; static unsigned g_tfmt[65536], g_tty[65536];
@@ -920,6 +923,13 @@ jobs:
             GLR(glTexImage2D); GLR(glPixelStorei);
             if (g_tex_log < 40 && w >= 64 && h >= 64) { g_tex_log++; L("[tex] glTexImage2D id=%u lv=%d %dx%d ifmt=0x%x fmt=0x%x ty=0x%x px=%s\n", id, lv, w, h, (unsigned)ifmt, fmt, ty, px ? "ada" : "NULL"); }
             if (tg == 0x0DE1u && lv > 0 && id < 65536u && g_tscaled[id]) return;   /* mip eksplisit untuk tekstur yang sudah diperkecil: dibuang */
+            if (tg == 0x0DE1u && lv == 0 && id < 4096u) snprintf(g_tpath[id], sizeof g_tpath[id], "%s", g_last_res);
+            if (tg == 0x0DE1u && lv == 0 && w >= 128 && h >= 128 && g_texsrc_log < 220) { g_texsrc_log++; L("[texsrc] id=%u %dx%d <- %s%s\n", id, w, h, g_last_res, px ? "" : " (alokasi kosong)"); }
+            {
+              int k, skip = 0;
+              for (k = 0; k < g_ntexskip; k++) if (strstr(g_last_res, g_texskip[k])) skip = 1;
+              if (skip) { if (g_tex_log < 400) L("[texdiv] id=%u DILEWATI (cocok --texskip): %s\n", id, g_last_res); if (tg == 0x0DE1u && lv == 0 && id < 65536u) g_tscaled[id] = 0; if (r_glTexImage2D) r_glTexImage2D(tg, lv, ifmt, w, h, b, fmt, ty, px); return; }
+            }
             if (g_texdiv > 1 && tg == 0x0DE1u && lv == 0 && ty == 0x1401u && (unsigned)ifmt == fmt && (fmt == 0x1908u || fmt == 0x1907u) &&
                 w >= 128 && h >= 128 && w / g_texdiv >= 1 && h / g_texdiv >= 1 && id < 65536u && r_glPixelStorei && r_glTexImage2D) {
               int bpp = fmt == 0x1908u ? 4 : 3, w2 = w / g_texdiv, h2 = h / g_texdiv;
@@ -970,9 +980,14 @@ jobs:
             if (tg == 0x0DE1u && lv == 0 && id < 65536u) g_tscaled[id] = 0;
             if (r_glCompressedTexImage2D) r_glCompressedTexImage2D(tg, lv, ifmt, w, h, b, sz, px);
           }
+          static unsigned g_tex_unsh_log;
+          static void tex_unshrink_why(unsigned id, const char *why) {
+            if (g_tex_unsh_log++ < 12) L("[texdiv] id=%u dikembalikan ke ukuran penuh: %s | sumber: %s\n", id, why, id < 4096u ? g_tpath[id] : "?");
+            tex_unshrink(id);
+          }
           static void b_glTexSubImage2D(unsigned tg, int lv, int xo, int yo, int w, int h, unsigned fmt, unsigned ty, const void *px) {
             unsigned id = g_bound[g_unit & 7];
-            GLR(glTexSubImage2D); GLR(glPixelStorei);
+            GLR(glTexSubImage2D); GLR(glPixelStorei); GLR(glBindTexture); GLR(glTexImage2D);
             g_tex_sub++;
             if (g_tex_sub <= 6) L("[tex] glTexSubImage2D id=%u lv=%d off=(%d,%d) %dx%d fmt=0x%x ty=0x%x scaled=%d\n", id, lv, xo, yo, w, h, fmt, ty, id < 65536u ? g_tscaled[id] : -1);
             if (tg == 0x0DE1u && id < 65536u && g_tscaled[id]) {
@@ -986,11 +1001,26 @@ jobs:
                   r_glTexSubImage2D(tg, lv, xo / g_texdiv, yo / g_texdiv, w2, h2, fmt, ty, sm);
                   r_glPixelStorei(0x0CF5u, old);
                   free(sm);
+                  return;
                 }
               }
-              return;
+              tex_unshrink_why(id, "update tekstur dengan format/ukuran yang tidak bisa diperkecil");   /* jangan membuang data: kembali penuh lalu teruskan apa adanya */
             }
             if (r_glTexSubImage2D) r_glTexSubImage2D(tg, lv, xo, yo, w, h, fmt, ty, px);
+          }
+          static void (*r_glCopyTexImage2D)(unsigned, int, unsigned, int, int, int, int, int);
+          static void (*r_glCopyTexSubImage2D)(unsigned, int, int, int, int, int, int, int);
+          static void b_glCopyTexImage2D(unsigned tg, int lv, unsigned ifmt, int x, int y, int w, int h, int b) {
+            unsigned id = g_bound[g_unit & 7];
+            GLR(glCopyTexImage2D);
+            if (tg == 0x0DE1u && id < 65536u && g_tscaled[id]) { if (g_tex_unsh_log++ < 12) L("[texdiv] id=%u glCopyTexImage2D -> ukuran penuh\n", id); g_tscaled[id] = 0; }
+            if (r_glCopyTexImage2D) r_glCopyTexImage2D(tg, lv, ifmt, x, y, w, h, b);
+          }
+          static void b_glCopyTexSubImage2D(unsigned tg, int lv, int xo, int yo, int x, int y, int w, int h) {
+            unsigned id = g_bound[g_unit & 7];
+            GLR(glCopyTexSubImage2D); GLR(glBindTexture); GLR(glTexImage2D);
+            if (tg == 0x0DE1u && id < 65536u && g_tscaled[id]) tex_unshrink_why(id, "glCopyTexSubImage2D (render ke tekstur)");
+            if (r_glCopyTexSubImage2D) r_glCopyTexSubImage2D(tg, lv, xo, yo, x, y, w, h);
           }
           static unsigned png_crc(unsigned c, const unsigned char *p, size_t n) {
             static unsigned tab[256];
@@ -1074,6 +1104,7 @@ jobs:
             {"glDrawArrays", (void *)b_glDrawArrays}, {"glDrawElements", (void *)b_glDrawElements}, {"glTexImage2D", (void *)b_glTexImage2D}, {"glTexSubImage2D", (void *)b_glTexSubImage2D}, {"glBindTexture", (void *)b_glBindTexture},
             {"glActiveTexture", (void *)b_glActiveTexture}, {"glPixelStorei", (void *)b_glPixelStorei}, {"glDeleteTextures", (void *)b_glDeleteTextures},
             {"glFramebufferTexture2D", (void *)b_glFramebufferTexture2D}, {"glFramebufferTexture2DOES", (void *)b_glFramebufferTexture2DOES}, {"glCompressedTexImage2D", (void *)b_glCompressedTexImage2D},
+            {"glCopyTexImage2D", (void *)b_glCopyTexImage2D}, {"glCopyTexSubImage2D", (void *)b_glCopyTexSubImage2D},
             {NULL, NULL}
           };
           static const void *shim_addr(const char *n) { int i; for (i = 0; shim[i].name; i++) if (!strcmp(shim[i].name, n)) return shim[i].addr; return NULL; }
@@ -2348,6 +2379,7 @@ jobs:
           /* satu permintaan loadResource, persis logika Java: path "/x" -> "x"; ekstensi json -> dibaca "x.json.amr"; baca aset APK (atau disk);
            * kalau gagal Java mengirim byte[0]; lalu GameService.loadResourceCallback(ptr, byte[], len) */
           static void res_deliver_one(const char *path, int64_t ptr) {
+            snprintf(g_last_res, sizeof g_last_res, "%s", path ? path : "");
             static nf_rescb_t cb;
             static int looked;
             unsigned char *buf = NULL;
@@ -2627,6 +2659,10 @@ jobs:
               else if (!strcmp(argv[i], "--sc") && i + 1 < argc) sc = pint(argv[++i]);
               else if (!strcmp(argv[i], "--audio") && i + 1 < argc) g_audio = pint(argv[++i]) != 0;
               else if (!strcmp(argv[i], "--texdiv") && i + 1 < argc) { g_texdiv = pint(argv[++i]); if (g_texdiv < 1) g_texdiv = 1; if (g_texdiv > 4) g_texdiv = 4; }
+              else if (!strcmp(argv[i], "--texskip") && i + 1 < argc) {
+                const char *z = argv[++i];
+                while (*z && g_ntexskip < 8) { size_t n = 0; while (z[n] && z[n] != ',') n++; if (n > 0 && n < 47) { memcpy(g_texskip[g_ntexskip], z, n); g_texskip[g_ntexskip][n] = 0; g_ntexskip++; } z += n; if (*z == ',') z++; }
+              }
               else if (!strcmp(argv[i], "--resq") && i + 1 < argc) g_res_sync = pint(argv[++i]) == 0;
               else if (!strcmp(argv[i], "--splashack") && i + 1 < argc) { const char *z = argv[++i]; g_splash_delay = (*z == '-') ? -1 : pint(z); }
               else if (!strcmp(argv[i], "--apk") && i + 1 < argc) g_apk_arg = argv[++i];
@@ -2636,7 +2672,7 @@ jobs:
               else if (argv[i][0] != '-') dir = argv[i];
             }
             g_log = fopen("loader_log.txt", "w");
-            L("== doodleloader (Milestone 3.15-maps) ==\n");
+            L("== doodleloader (Milestone 3.17-texsrc) ==\n");
             if (uname(&u) == 0) L("device: %s %s %s | glibc %s\n", u.sysname, u.release, u.machine, gnu_get_libc_version());
             L("libs: %s | stage=%d timeout=%ds frames=%d sc=%d apk=%s\n", dir, stage, timeout, frames, sc, g_apk_arg);
           #if !defined(__aarch64__)
